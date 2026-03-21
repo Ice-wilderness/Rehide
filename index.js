@@ -478,7 +478,11 @@ function getCurrentHideSettings() {
         console.warn(`[${extensionName} DEBUG] getCurrentHideSettings: Could not determine entityId.`);
         return null;
     }
-    const settings = extension_settings[extensionName]?.settings_by_entity?.[entityId] || null;
+    let settings = extension_settings[extensionName]?.settings_by_entity?.[entityId];
+    if (!settings) {
+        console.debug(`[${extensionName} DEBUG] getCurrentHideSettings: No settings found for entityId "${entityId}", using default for role mode (hideLastN: 6).`);
+        settings = { hideLastN: 6, lastProcessedLength: 0, userConfigured: true };
+    }
     console.debug(`[${extensionName} DEBUG] getCurrentHideSettings: Read settings for entityId "${entityId}":`, settings);
     return settings;
 }
