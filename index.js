@@ -795,7 +795,12 @@ async function runIncrementalHideCheck() {
         if (toHideIncrementally.length > 0) {
             console.log(`[${extensionName}] Incrementally hiding messages: Indices [${toHideIncrementally.join(', ')}]`);
             console.debug(`[${extensionName} DEBUG] runIncrementalHideCheck: Updating chat array data...`);
-            toHideIncrementally.forEach(idx => { if (chat[idx]) chat[idx].is_system = true; });
+            toHideIncrementally.forEach(idx => { 
+                if (chat[idx]) {
+                    chat[idx].is_system = true; 
+                    chat[idx].hide_helper_hidden = true;
+                }
+            });
             console.debug(`[${extensionName} DEBUG] runIncrementalHideCheck: Chat array data updated.`);
 
             try {
@@ -882,11 +887,13 @@ async function runFullHideCheck() {
         if (shouldBeHidden && !isCurrentlyHidden) {
             console.debug(`[${extensionName} DEBUG] runFullHideCheck: Index ${i} should be hidden but isn't. Marking to hide.`);
             msg.is_system = true;
+            msg.hide_helper_hidden = true;
             toHide.push(i);
             changed = true;
-        } else if (!shouldBeHidden && isCurrentlyHidden) {
+        } else if (!shouldBeHidden && isCurrentlyHidden && msg.hide_helper_hidden === true) {
             console.debug(`[${extensionName} DEBUG] runFullHideCheck: Index ${i} should be shown but is hidden. Marking to show.`);
             msg.is_system = false;
+            delete msg.hide_helper_hidden;
             toShow.push(i);
             changed = true;
         }
@@ -965,8 +972,8 @@ async function unhideAllMessages() {
     const toShow = [];
     console.log(`[${extensionName}] Unhide all: Scanning chat for hidden messages...`);
     for (let i = 0; i < chatLength; i++) {
-        if (chat[i] && chat[i].is_system === true) {
-            console.debug(`[${extensionName} DEBUG] Unhide all: Found hidden message at index ${i}. Marking to show.`);
+        if (chat[i] && chat[i].is_system === true && chat[i].hide_helper_hidden === true) {
+            console.debug(`[${extensionName} DEBUG] Unhide all: Found plugin-hidden message at index ${i}. Marking to show.`);
             toShow.push(i);
         }
     }
@@ -974,7 +981,12 @@ async function unhideAllMessages() {
 
     if (toShow.length > 0) {
         console.log(`[${extensionName}] Unhide all: Updating chat array data...`);
-        toShow.forEach(idx => { if (chat[idx]) chat[idx].is_system = false; });
+        toShow.forEach(idx => { 
+            if (chat[idx]) {
+                chat[idx].is_system = false;
+                delete chat[idx].hide_helper_hidden;
+            }
+        });
         console.log(`[${extensionName}] Unhide all: Chat data updated.`);
         try {
             console.log(`[${extensionName}] Unhide all: Updating DOM...`);
