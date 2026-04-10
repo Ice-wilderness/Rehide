@@ -4,6 +4,9 @@ import { extension_settings, loadExtensionSettings, getContext } from "../../../
 import { saveSettingsDebounced, eventSource, event_types, getRequestHeaders, characters, scrollChatToBottom } from "../../../../script.js";
 
 import { groups } from "../../../group-chats.js";
+import { power_user } from "../../../power-user.js";
+import { getTokenCountAsync } from "../../../tokenizers.js";
+import { promptManager } from "../../../openai.js";
 
 const extensionName = "hide";
 const defaultSettings = {
@@ -22,11 +25,18 @@ const defaultSettings = {
     },
     // --- Limiter 设置 ---
     limiter_isEnabled: false,
-    limiter_messageLimit: 20,
+    limiter_migration_v2_complete: false,
 };
+
+// Limiter 双向同步防重入标志
+let _limiterSyncing = false;
 
 // 缓存上下文
 let cachedContext = null;
+
+// --- 聊天统计 (Token Stats) 数据存储 ---
+let calculatedWiTokens = 0;
+let wiDetailedStats = {};
 
 // DOM元素缓存
 const domCache = {
@@ -281,6 +291,26 @@ function loadSettings() {
     }
     // --------------------------
 
+    // --- Limiter v2 迁移: 从 limiter_messageLimit 迁移到 power_user.chat_truncation ---
+    if (!extension_settings[extensionName].limiter_migration_v2_complete) {
+        const settings = extension_settings[extensionName];
+        if (typeof settings.limiter_messageLimit === 'number') {
+            if (settings.limiter_isEnabled && settings.limiter_messageLimit > 0) {
+                power_user.chat_truncation = settings.limiter_messageLimit;
+                if ($('#chat_truncation').length) {
+                    $('#chat_truncation').val(settings.limiter_messageLimit);
+                    $('#chat_truncation_counter').val(settings.limiter_messageLimit);
+                }
+                saveSettingsDebounced();
+                console.log(`[${extensionName}] Limiter v2 迁移: 已将 limiter_messageLimit=${settings.limiter_messageLimit} 写入 chat_truncation`);
+            }
+            delete settings.limiter_messageLimit;
+            console.log(`[${extensionName}] Limiter v2 迁移: 已删除旧字段 limiter_messageLimit`);
+        }
+        settings.limiter_migration_v2_complete = true;
+        saveSettingsDebounced();
+    }
+
     console.log(`[${extensionName}] 设置已加载/初始化:`, JSON.parse(JSON.stringify(extension_settings[extensionName]))); // 深拷贝打印避免循环引用
 }
 
@@ -348,6 +378,7 @@ function createPopup() {
             <div class="popup-tabs-nav">
                 <div class="tab-button active" data-tab="hide-panel">隐藏楼层</div>
                 <div class="tab-button" data-tab="limiter-panel">限制楼层</div>
+                <div class="tab-button" data-tab="token-stats-panel">聊天统计</div>
                 <div class="tab-button" data-tab="instructions-panel">使用说明</div>
             </div>
 
@@ -393,15 +424,24 @@ function createPopup() {
                         </div>
                     </div>
                     <div class="limiter-setting-item">
-                        <label for="limiter-count">仅显示最新的消息楼层数量</label>
-                        <input id="limiter-count" type="number" class="text_pole" min="1" max="500" placeholder="例如: 20">
+                        <label for="limiter-count">加载的消息楼层数量</label>
+                        <input id="limiter-count" type="number" class="text_pole" min="0" max="1000" step="5" placeholder="例如: 20">
                     </div>
                     <div class="limiter-description">
-                        该功能会实时动态限制聊天界面加载的消息楼层数量，以减少酒馆卡顿，提高流畅度。没有加载（且也未被隐藏）的楼层消息依然会被当做上下文发送给AI。
+                        该功能会实时动态限制聊天界面加载的消息楼层数量，以减少酒馆卡顿，提高流畅度。建议加载的消息楼层数量不要超过20。没有加载（且也未被隐藏）的楼层消息依然会被当做上下文发送给AI。该功能实际上和酒馆原生的【要渲染 # 条消息】是同一个接口，因此和酒馆或酒馆助手以及鸡尾酒插件的“限制消息加载”功能不会冲突。
                     </div>
                 </div>
 
-                <!-- 面板3: 使用说明 -->
+                <!-- 面板3: 聊天统计 -->
+                <div id="token-stats-panel" class="tab-panel" data-tab="token-stats-panel">
+                    <div id="token-stats-content" class="tub-body tub-scrollable">
+                        <div class="tub-row-1" id="tub-row-overview"></div>
+                        <div class="tub-row-2" id="tub-row-wi-chart"></div>
+                        <div id="tub-entries-section"></div>
+                    </div>
+                </div>
+
+                <!-- 面板4: 使用说明 -->
                 <div id="instructions-panel" class="tab-panel" data-tab="instructions-panel">
                     <div id="hide-helper-instructions-content" class="hide-helper-instructions-content">
                         
@@ -422,6 +462,9 @@ function createPopup() {
                         <p>
                            此功能的核心是：在每次与AI交互时，仅发送最新的N条消息作为上下文，并自动隐藏其余的旧消息。
                         </p>
+                        <p class="important">
+                            <i class="fa-solid fa-shield-halved"></i> <strong>双重保护机制：</strong>本插件同时使用“消息隐藏”和“请求拦截”两种方式确保旧消息不会被发送给AI。即使某些消息楼层因特殊原因未能生效（例如被其他插件/脚本的隐藏功能覆盖），拦截机制仍会在API请求发出前强制截断消息列表，作为最终兜底保障，确保实际上发送的消息楼层真的只有最近N条消息楼层。
+                        </p>
                         <p>
                             在输入框中填入您想 <strong>保留的最新消息数量</strong> (例如 <code>4</code>)，然后点击 <span class="button-like">保存设置</span> 按钮。插件便会立即生效，隐藏设定范围之外的所有内容。
                         </p>
@@ -433,7 +476,7 @@ function createPopup() {
                             您可以通过弹窗中的 <strong>拨动开关</strong> 在两种模式间轻松切换：
                             <ul>
                                 <li><strong>全局模式：</strong> 在此模式下，您设置的保留数量将应用于 <strong>所有</strong> 角色卡和群聊。一次设置，处处生效。</li>
-                                <li><strong>角色模式：</strong> 在此模式下，设置将 <strong>仅</strong> 绑定到当前聊天。您可以为每个角色或群聊设定并保存一个独立的保留数量。</li>
+                                <li><strong>角色模式：</strong> 在此模式下，设置将 <strong>仅</strong> 绑定到当前角色。您可以为每个角色或群聊设定并保存一个独立的保留数量。</li>
                             </ul>
                         </p>
                          <h3>取消隐藏</h3>
@@ -441,18 +484,18 @@ function createPopup() {
                             点击 <span class="button-like">取消隐藏</span> 按钮后，插件会立刻将当前模式（全局或角色）的隐藏设置重置为0，此时所有被隐藏的楼层都会重新显示。
                         </p>
                         <p class="important">
-                            <i class="fa-solid fa-circle-info"></i> 被隐藏的消息 <strong>不会</strong> 被包含在发送给AI的上下文中。这意味着AI无法"看到"这些内容，这对于控制上下文长度和引导对话非常有帮助。
+                            <i class="fa-solid fa-circle-info"></i> 被隐藏的消息 <strong>不会</strong> 被包含在发送给AI的上下文中。这意味着AI无法“看到”这些内容，这对于控制上下文长度和引导对话非常有帮助。
                         </p>
 
                         <h2>限制楼层 (功能2)</h2>
                         <p>
-                            此功能旨在优化超长对话的浏览体验。它只影响您在聊天窗口中<strong>【显示】</strong>的消息数量，而不会修改任何聊天数据或影响发送给AI的上下文。
+                            此功能通过控制酒馆原生的“加载消息数”设置来优化超长对话的浏览体验。它只影响您在酒馆聊天界面中<strong>【显示】</strong>的消息数量，而不会修改任何聊天数据或影响发送给AI的上下文。由于限制酒馆界面加载的消息数量，因此该功能可以极大减少酒馆的卡顿，尤其是高楼层聊天。
                         </p>
                         <p>
-                           <strong>示例：</strong> 您设置只<strong>显示</strong>最新的 <code>20</code> 条消息。即使您的完整对话有1000条，聊天窗口也只会加载并显示最后20条，让界面保持清爽和流畅。
+                            开启后，您可以在此处或酒馆的“用户设置”面板中的“要渲染 # 条消息”调整数值，两者自动同步。设为 <code>0</code> 表示不限制（加载全部消息）。
                         </p>
                         <p>
-                           要使用此功能，请打开<strong>【启用消息数量限制】</strong>的开关，并在下方的输入框中填入您希望显示的消息数量即可。
+                           <strong>示例：</strong> 您设置加载 <code>20</code> 条消息。即使完整对话有1000条，聊天窗口也只加载并显示最后20条。如果需要查看更早的消息，可以点击聊天底部的“Show more messages”按钮。
                         </p>
                     </div>
                 </div>
@@ -533,139 +576,6 @@ function saveCurrentHideSettings(hideLastN) {
     return true;
 }
 
-/**
- * Limiter: 核心功能：应用消息数量限制。
- */
-function limiter_applyLimit() {
-    // 关键修复：检查当前是否有有效的实体ID。
-    // 如果返回 null，说明处于"临时聊天"或"欢迎界面"，此时不能执行 clearChat，否则会删除 welcomePanel。
-    if (!getCurrentEntityId()) return;
-
-    const settings = extension_settings[extensionName];
-    if (!settings.limiter_isEnabled) {
-        // 如果插件被禁用，但当前视图是受限的，需要重新加载以恢复完整视图
-        if ($('#chat').attr('data-limiter-active')) {
-            // SillyTavern's reloadCurrentChat() is often too slow or buggy,
-            // a full hide check can restore the view more reliably.
-            runFullHideCheck();
-            $('#chat').removeAttr('data-limiter-active');
-        }
-        return;
-    }
-
-    // 给聊天窗口添加一个标记，表示它当前是受限视图
-    $('#chat').attr('data-limiter-active', 'true');
-
-    if ($('#chat .edit_textarea').length > 0) {
-        console.log("[Hide Helper / Limiter] 用户正在编辑消息，已取消重绘。");
-        return;
-    }
-
-    const limit = settings.limiter_messageLimit;
-    if (limit <= 0) return;
-
-    // 【修正1】: 不再解构 refreshSwipeButtons，而是获取包含它的 swipe 对象
-    const { chat, clearChat, addOneMessage, swipe } = getContextOptimized();
-    if (!chat || !clearChat || !addOneMessage || !swipe) {
-        console.error("[Hide Helper / Limiter] Context functions not available.");
-        return;
-    }
-
-    clearChat();
-
-    const messagesToDisplay = chat.slice(-limit);
-
-    messagesToDisplay.forEach(message => {
-        const originalIndex = chat.indexOf(message);
-        addOneMessage(message, {
-            scroll: false,
-            forceId: originalIndex
-        });
-    });
-
-    // 通过 swipe.refresh() 正确调用函数
-    swipe.refresh();
-
-    // 实施健壮的延迟滚动逻辑，解决刷新和调整时的滚动问题
-    setTimeout(() => {
-        const images = $('#chat .mes img');
-        const imageCount = images.length;
-
-        if (imageCount === 0) {
-            // 如果没有图片，直接滚动到底部
-            scrollChatToBottom();
-        } else {
-            // 如果有图片，则等待所有图片加载完成后再滚动
-            let loadedCount = 0;
-            const onImageSettled = () => {
-                loadedCount++;
-                if (loadedCount >= imageCount) {
-                    scrollChatToBottom();
-                }
-            };
-
-            images.each(function() {
-                // 对于已经加载完成（如从缓存读取）的图片，浏览器可能不会再次触发 'load' 事件
-                if (this.complete) {
-                    onImageSettled();
-                } else {
-                    // 监听 load 和 error 事件，确保无论成功或失败都会触发回调
-                    $(this).on('load', onImageSettled).on('error', onImageSettled);
-                }
-            });
-        }
-    }, 0);
-
-    $('#show_more_messages').remove();
-}
-
-/**
- * Limiter: 处理新消息的增量更新
- */
-function limiter_handleNewMessage() {
-    const settings = extension_settings[extensionName];
-    if (!settings.limiter_isEnabled) return;
-
-    setTimeout(() => {
-        const limit = settings.limiter_messageLimit;
-        const messageElements = $('#chat .mes');
-
-        if (messageElements.length > limit) {
-            messageElements.first().remove();
-        }
-    }, 0);
-}
-
-/**
- * Limiter: 处理消息删除后的视图补充
- */
-function limiter_handleDeletedMessage() {
-    const settings = extension_settings[extensionName];
-    if (!settings.limiter_isEnabled) return;
-
-    setTimeout(() => {
-        const limit = settings.limiter_messageLimit;
-        const messageElements = $('#chat .mes');
-        const currentCount = messageElements.length;
-
-        const { chat, addOneMessage } = getContextOptimized();
-         if (!chat || !addOneMessage) return;
-
-        if (currentCount < limit && chat.length > currentCount) {
-            const oldestMesId = parseInt(messageElements.first().attr('mesid'));
-            const messageToAddIndex = oldestMesId - 1;
-
-            if (messageToAddIndex >= 0 && chat[messageToAddIndex]) {
-                addOneMessage(chat[messageToAddIndex], {
-                    scroll: false,
-                    forceId: messageToAddIndex,
-                    insertBefore: oldestMesId
-                });
-            }
-        }
-    }, 0);
-}
-
 // 更新当前设置显示
 function updateCurrentHideSettingsDisplay() {
     console.debug(`[${extensionName} DEBUG] Entering updateCurrentHideSettingsDisplay.`);
@@ -688,9 +598,9 @@ function updateCurrentHideSettingsDisplay() {
     $('#hide-mode-description').text(useGlobal ? '隐藏将应用于所有角色卡' : '隐藏仅对当前角色卡生效');
 
     // --- 更新 Limiter 面板 ---
-    const settings = extension_settings[extensionName];
-    $('#limiter-enabled').prop('checked', settings.limiter_isEnabled);
-    $('#limiter-count').val(settings.limiter_messageLimit);
+    const nativeTruncation = power_user.chat_truncation;
+    $('#limiter-enabled').prop('checked', extension_settings[extensionName].limiter_isEnabled);
+    $('#limiter-count').val(nativeTruncation);
 
     console.debug(`[${extensionName} DEBUG] Exiting updateCurrentHideSettingsDisplay.`);
 }
@@ -1014,9 +924,301 @@ async function unhideAllMessages() {
      console.log(`[${extensionName}] Unhide all completed in ${performance.now() - startTime}ms`);
 }
 
+// ==================== 聊天统计 (Token Stats) 功能 ====================
+
+// 更新 Token 统计 UI
+function updateTokenStatsUI() {
+    if (!promptManager || !promptManager.messages) return;
+    const pm = promptManager;
+
+    // 1. 计算各项 Token 数值
+    const totalTokens = pm.tokenUsage || 0;
+    let chatTokens = 0;
+
+    const findCollectionById = (c, id) => {
+        if (c.identifier === id) return c;
+        if (c.collection) {
+            for (const i of c.collection) {
+                if (i instanceof Object && i.collection) {
+                    const f = findCollectionById(i, id);
+                    if (f) return f;
+                }
+            }
+        }
+        return null;
+    };
+
+    const chatHistory = findCollectionById(pm.messages, 'chatHistory');
+    if (chatHistory) {
+        chatHistory.getCollection().forEach(msg => {
+            if (msg.role === 'user' || msg.role === 'assistant') chatTokens += msg.getTokens();
+        });
+    }
+
+    const wiTokens = calculatedWiTokens;
+    let otherTokens = totalTokens - chatTokens - wiTokens;
+    if (otherTokens < 0) otherTokens = 0;
+
+    // 2. 无论面板是否可见，都在后台更新 DOM 内容
+    renderTokenStatsContent(totalTokens, chatTokens, wiTokens, otherTokens);
+}
+
+// 渲染 Token 统计内容
+function renderTokenStatsContent(totalTokens, chatTokens, wiTokens, otherTokens) {
+    if (!totalTokens && totalTokens !== 0) return;
+
+    const getPct = (v) => totalTokens > 0 ? ((v / totalTokens) * 100).toFixed(1) : 0;
+
+    // 渲染概览行
+    document.getElementById('tub-row-overview').innerHTML = `
+        <div class="tub-stat-box"><span class="tub-stat-label">总共</span><span class="tub-stat-value">${totalTokens}</span></div>
+        <div class="tub-stat-box"><span class="tub-stat-label">聊天</span><span class="tub-stat-value">${chatTokens}<br><small>${getPct(chatTokens)}%</small></span></div>
+        <div class="tub-stat-box"><span class="tub-stat-label">世界书</span><span class="tub-stat-value">${wiTokens}<br><small>${getPct(wiTokens)}%</small></span></div>
+        <div class="tub-stat-box"><span class="tub-stat-label">其他</span><span class="tub-stat-value">${otherTokens}<br><small>${getPct(otherTokens)}%</small></span></div>
+    `;
+
+    // 计算常量和动态世界书 tokens
+    let totalC = 0, totalD = 0;
+    for (const b in wiDetailedStats) {
+        wiDetailedStats[b].constant.forEach(e => totalC += e.tokens);
+        wiDetailedStats[b].dynamic.forEach(e => totalD += e.tokens);
+    }
+    renderPieView(totalC, totalD, totalC + totalD);
+
+    // 渲染条目列表
+    const books = Object.keys(wiDetailedStats);
+    let filtersHtml = '';
+    if (books.length > 1) {
+        filtersHtml = `
+            <div class="tub-book-filters">
+                <button class="tub-book-btn active" data-book="all">All Books</button>
+                ${books.map(b => `<button class="tub-book-btn" data-book="${b}">${b}</button>`).join('')}
+            </div>
+        `;
+    }
+
+    const sectionHtml = `
+        <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 10px;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <div class="tub-section-title tub-title-text" style="margin-bottom:0;">已激活条目</div>
+                <div class="tub-search-wrapper">
+                    <svg class="tub-search-icon" id="tub-search-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                    </svg>
+                    <input type="text" id="tub-search-input" class="tub-search-input" placeholder="搜索条目...">
+                </div>
+            </div>
+            <div id="tub-entries-total-display" style="font-size: 0.85em; font-weight: bold; color: #343a40 !important;"></div>
+        </div>
+        ${filtersHtml}
+        <div class="tub-row-3 tub-scrollable" id="tub-row-entries"></div>
+    `;
+    document.getElementById('tub-entries-section').innerHTML = sectionHtml;
+
+    // 状态保存，用于交叉过滤
+    let currentBookFilter = 'all';
+    let currentSearchTerm = '';
+
+    const renderEntriesList = () => {
+        const entriesContainer = document.getElementById('tub-row-entries');
+        const totalDisplay = document.getElementById('tub-entries-total-display');
+        entriesContainer.innerHTML = '';
+
+        let combined = [];
+        let filterTotalC = 0;
+        let filterTotalD = 0;
+
+        for (const b in wiDetailedStats) {
+            if (currentBookFilter !== 'all' && b !== currentBookFilter) continue;
+
+            // 过滤并压入 dynamic
+            wiDetailedStats[b].dynamic.forEach(e => {
+                if (currentSearchTerm && !e.name.toLowerCase().includes(currentSearchTerm)) return;
+                combined.push({ ...e, b, type: 'dynamic' });
+                filterTotalD += e.tokens;
+            });
+            // 过滤并压入 constant
+            wiDetailedStats[b].constant.forEach(e => {
+                if (currentSearchTerm && !e.name.toLowerCase().includes(currentSearchTerm)) return;
+                combined.push({ ...e, b, type: 'constant' });
+                filterTotalC += e.tokens;
+            });
+        }
+
+        const filterTotal = filterTotalC + filterTotalD;
+        totalDisplay.innerHTML = `${filterTotal}t (<span style="color:#22c55e !important;">${filterTotalD}t</span> + <span style="color:#3b82f6 !important;">${filterTotalC}t</span>)`;
+
+        combined.sort((a, b) => {
+            if (a.type !== b.type) return a.type === 'dynamic' ? -1 : 1;
+            return b.tokens - a.tokens;
+        });
+
+        if (!combined.length) {
+            entriesContainer.innerHTML = '<div style="text-align:center;color:#868e96;padding:10px 0; direction: ltr !important;">No active entries found</div>';
+            return;
+        }
+
+        const absoluteMax = Math.max(...combined.map(e => e.tokens));
+
+        combined.forEach(e => {
+            const pct = absoluteMax > 0 ? ((e.tokens / absoluteMax) * 100).toFixed(1) : 0;
+            const bookTag = (currentBookFilter === 'all' && books.length > 1) ? ` <span style="color:#868e96;font-size:0.85em;font-weight:normal;">(${e.b})</span>` : '';
+
+            let gradientBg = '';
+            if (e.type === 'constant') {
+                gradientBg = `background: linear-gradient(to right, #dbeafe ${pct}%, #f8fafc ${pct}%);`;
+            } else {
+                gradientBg = `background: linear-gradient(to right, #dcfce7 ${pct}%, #f8fafc ${pct}%);`;
+            }
+
+            entriesContainer.insertAdjacentHTML('beforeend', `
+                <div class="tub-new-list-item" style="${gradientBg}">
+                    <div class="tub-nli-label" title="${e.name}">${e.name}${bookTag}</div>
+                    <div class="tub-nli-value">${e.tokens}</div>
+                </div>`);
+        });
+
+        // 初始化滚动条逻辑
+        initScrollbarLogic();
+    };
+
+    renderEntriesList();
+
+    // 绑定书籍按钮事件
+    if (books.length > 1) {
+        const btns = document.querySelectorAll('.tub-book-btn');
+        btns.forEach(btn => {
+            btn.onclick = () => {
+                btns.forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                currentBookFilter = btn.getAttribute('data-book');
+                renderEntriesList();
+            };
+        });
+    }
+
+    // 绑定搜索框事件
+    const searchIcon = document.getElementById('tub-search-icon');
+    const searchInput = document.getElementById('tub-search-input');
+
+    searchIcon.onclick = () => {
+        searchInput.classList.toggle('active');
+        if (searchInput.classList.contains('active')) {
+            searchInput.focus();
+        } else {
+            searchInput.value = '';
+            currentSearchTerm = '';
+            renderEntriesList();
+        }
+    };
+
+    searchInput.addEventListener('input', debounce((e) => {
+        currentSearchTerm = e.target.value.toLowerCase();
+        renderEntriesList();
+    }, 300));
+}
+
+// 渲染饼图
+function renderPieView(c, d, total) {
+    const container = document.getElementById('tub-row-wi-chart');
+    if (!total) { container.innerHTML = '<div style="color:#868e96 !important;">No World Info Active</div>'; return; }
+
+    const cPct = (c / total) * 100;
+    const dPct = (d / total) * 100;
+
+    const cAngle = (cPct / 2) * 3.6;
+    const cRad = (cAngle - 90) * (Math.PI / 180);
+    const cX = 50 + 30 * Math.cos(cRad);
+    const cY = 50 + 30 * Math.sin(cRad);
+
+    const dAngle = (cPct + dPct / 2) * 3.6;
+    const dRad = (dAngle - 90) * (Math.PI / 180);
+    const dX = 50 + 30 * Math.cos(dRad);
+    const dY = 50 + 30 * Math.sin(dRad);
+
+    container.innerHTML = `
+        <div class="tub-pie-chart" style="background: conic-gradient(#3b82f6 0% ${cPct}%, #22c55e ${cPct}% 100%);">
+            ${cPct >= 5 ? `<span class="tub-pie-text" style="left: ${cX}px; top: ${cY}px;">${cPct.toFixed(0)}%</span>` : ''}
+            ${dPct >= 5 ? `<span class="tub-pie-text" style="left: ${dX}px; top: ${dY}px;">${dPct.toFixed(0)}%</span>` : ''}
+        </div>
+        <div class="tub-legend">
+            <div style="display:flex; align-items:center;"><span class="tub-dot tub-dot-blue"></span>蓝灯: ${c}</div>
+            <div style="display:flex; align-items:center;"><span class="tub-dot tub-dot-green"></span>绿灯: ${d}</div>
+        </div>
+    `;
+}
+
+// 滚动条自动隐藏/显示逻辑
+function initScrollbarLogic() {
+    const scrollables = document.querySelectorAll('#token-stats-panel .tub-scrollable');
+    scrollables.forEach(el => {
+        if (el.dataset.scrollInit) return;
+        el.dataset.scrollInit = "true";
+
+        let scrollTimeout;
+        const hideScrollbar = () => el.classList.remove('is-scrolling');
+
+        el.addEventListener('scroll', () => {
+            el.classList.add('is-scrolling');
+            clearTimeout(scrollTimeout);
+            scrollTimeout = setTimeout(() => {
+                if (!el.matches(':hover')) hideScrollbar();
+            }, 2000);
+        });
+
+        el.addEventListener('mouseleave', () => {
+            clearTimeout(scrollTimeout);
+            scrollTimeout = setTimeout(hideScrollbar, 2000);
+        });
+    });
+}
+
+// ==================== 聊天统计功能结束 ====================
+
 // 设置UI元素的事件监听器
 function setupEventListeners() {
     console.log(`[${extensionName}] Entering setupEventListeners.`);
+
+    // --- 聊天统计 (Token Stats) 事件监听 ---
+
+    // 世界书扫描完成事件
+    eventSource.on(event_types.WORLDINFO_SCAN_DONE, async (data) => {
+        if (!data || !data.activated || !data.activated.entries) return;
+        calculatedWiTokens = 0;
+        wiDetailedStats = {};
+        const entries = Array.from(data.activated.entries.values());
+
+        await Promise.all(entries.map(async (entry) => {
+            const tokens = await getTokenCountAsync(entry.content);
+            const bookName = entry.world || "Embedded/Other";
+            let entryName = entry.comment || (entry.key && entry.key[0] ? `[Key: ${entry.key[0]}]` : `[UID: ${entry.uid}]`);
+            const type = entry.constant ? "constant" : "dynamic";
+
+            if (!wiDetailedStats[bookName]) {
+                wiDetailedStats[bookName] = { constant: [], dynamic: [], total: 0 };
+            }
+            wiDetailedStats[bookName][type].push({ name: entryName, tokens: tokens });
+            wiDetailedStats[bookName].total += tokens;
+            calculatedWiTokens += tokens;
+        }));
+
+        // 移除 if 判断，直接调用更新
+        updateTokenStatsUI();
+    });
+
+    // 世界书更新事件
+    if (event_types.WORLDINFO_UPDATED) {
+        eventSource.on(event_types.WORLDINFO_UPDATED, () => {
+            updateTokenStatsUI(); // 移除 if 判断
+        });
+    }
+
+    // Prompt 准备完成事件
+    eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, () => {
+        updateTokenStatsUI(); // 移除 if 判断
+    });
+
+    // --- 聊天统计事件监听结束 ---
 
     // --- 新增：为"使用说明"面板初始化自定义滚动条 ---
     try {
@@ -1078,6 +1280,9 @@ function setupEventListeners() {
         console.log(`[${extensionName}] Wand button: Extension enabled. Updating display before showing popup.`);
         updateCurrentHideSettingsDisplay();
 
+        // ---- 【新增这一行，打开弹窗立刻执行统计】 ----
+        updateTokenStatsUI();
+
         const $popup = $('#hide-helper-popup');
         $popup.show();
         centerPopup($popup);
@@ -1097,6 +1302,12 @@ function setupEventListeners() {
         $(this).addClass('active');
         $('.tab-panel').removeClass('active');
         $(`.tab-panel[data-tab="${targetTab}"]`).addClass('active');
+
+        // 如果切换到聊天统计标签，更新UI
+        if (targetTab === 'token-stats-panel') {
+            updateTokenStatsUI();
+            // 这里删除了对 initTokenStatsScrollbar(); 的调用
+        }
     });
 
     // --- 全局插件开关 ---
@@ -1113,28 +1324,9 @@ function setupEventListeners() {
             console.log(`[${extensionName}] Extension enabled via toggle. Running full check.`);
             toastr.success('隐藏助手已启用');
             runFullHideCheckDebounced();
-            // 如果限制器开启，应用限制
-            if (extension_settings[extensionName].limiter_isEnabled) {
-                 limiter_applyLimit();
-            }
         } else {
             console.log(`[${extensionName}] Extension disabled via toggle.`);
             toastr.warning('隐藏助手已禁用');
-
-            // --- 修复开始：关闭插件时，如果限制器处于激活状态，强制重置聊天视图 ---
-            if ($('#chat').attr('data-limiter-active')) {
-                console.log(`[${extensionName}] Disable toggle: Limiter was active. Reloading chat to restore view.`);
-                $('#chat').removeAttr('data-limiter-active');
-                // 获取上下文中的重新加载函数
-                const { reloadCurrentChat } = getContext();
-                if (reloadCurrentChat) {
-                    reloadCurrentChat();
-                } else {
-                    // 备选方案，如果没获取到函数，刷新页面或重新触发一次不带限制的加载
-                    location.reload();
-                }
-            }
-            // --- 修复结束 ---
         }
     });
 
@@ -1221,24 +1413,58 @@ function setupEventListeners() {
     // --- 面板2: Limiter 设置 ---
 
     function onLimiterSettingsChange() {
-        const settings = extension_settings[extensionName];
-        settings.limiter_isEnabled = $('#limiter-enabled').is(':checked');
-        settings.limiter_messageLimit = Number($('#limiter-count').val());
-        saveSettingsDebounced();
+        if (_limiterSyncing) return;
+        _limiterSyncing = true;
 
-        // 立即应用或移除限制
-        if (settings.limiter_isEnabled) {
-            limiter_applyLimit();
-        } else {
-            // Manually trigger a reload if limiter was active
-            if ($('#chat').attr('data-limiter-active')) {
-                $('#chat').removeAttr('data-limiter-active');
+        try {
+            const settings = extension_settings[extensionName];
+            const isEnabled = $('#limiter-enabled').is(':checked');
+            const count = Number($('#limiter-count').val()) || 0;
+
+            settings.limiter_isEnabled = isEnabled;
+            saveSettingsDebounced();
+
+            if (isEnabled && count > 0) {
+                // 同步到原生 chat_truncation
+                power_user.chat_truncation = count;
+                if ($('#chat_truncation').length) {
+                    $('#chat_truncation').val(count);
+                    $('#chat_truncation_counter').val(count);
+                }
+                // 立即生效：重载聊天
                 const { reloadCurrentChat } = getContext();
-                if (reloadCurrentChat) reloadCurrentChat();
+                if (reloadCurrentChat) {
+                    reloadCurrentChat();
+                }
             }
+            // 禁用时不修改 chat_truncation，不再干预原生消息加载机制
+        } finally {
+            _limiterSyncing = false;
         }
     }
     $('#limiter-enabled, #limiter-count').on('change', onLimiterSettingsChange);
+
+    // --- 双向同步: 原生 #chat_truncation 变更 → 插件状态同步 ---
+    $('#chat_truncation').on('input', function() {
+        if (_limiterSyncing) return;
+        _limiterSyncing = true;
+
+        try {
+            const nativeValue = power_user.chat_truncation;
+            const settings = extension_settings[extensionName];
+
+            settings.limiter_isEnabled = nativeValue > 0;
+            saveSettingsDebounced();
+
+            // 如果弹窗当前可见，同步更新插件 UI
+            if ($('#hide-helper-popup').is(':visible')) {
+                $('#limiter-enabled').prop('checked', settings.limiter_isEnabled);
+                $('#limiter-count').val(nativeValue);
+            }
+        } finally {
+            _limiterSyncing = false;
+        }
+    });
 
     // --- 核心事件监听 (协同工作) ---
 
@@ -1248,13 +1474,8 @@ function setupEventListeners() {
 
         updateCurrentHideSettingsDisplay(); // 更新所有UI
 
-        // 协同执行: 1. Hide数据处理 -> 2. Limiter视图渲染
         if (extension_settings[extensionName]?.enabled) {
             runFullHideCheck(); // 立即执行，非防抖，确保数据最新
-        }
-        // 增加全局开关判断
-        if (extension_settings[extensionName]?.enabled && extension_settings[extensionName]?.limiter_isEnabled) {
-            limiter_applyLimit();
         }
     });
 
@@ -1262,10 +1483,6 @@ function setupEventListeners() {
         console.debug(`[${extensionName} DEBUG] Event received: ${eventType}`);
         if (extension_settings[extensionName]?.enabled) {
             setTimeout(() => runIncrementalHideCheck(), 100);
-        }
-        // 增加全局开关判断
-        if (extension_settings[extensionName]?.enabled && extension_settings[extensionName]?.limiter_isEnabled) {
-            limiter_handleNewMessage();
         }
     };
     eventSource.on(event_types.MESSAGE_RECEIVED, () => handleNewMessage(event_types.MESSAGE_RECEIVED));
@@ -1275,10 +1492,6 @@ function setupEventListeners() {
         console.log(`[${extensionName}] Event received: ${event_types.MESSAGE_DELETED}`);
         if (extension_settings[extensionName]?.enabled) {
             runFullHideCheckDebounced();
-        }
-        // 增加全局开关判断
-        if (extension_settings[extensionName]?.enabled && extension_settings[extensionName]?.limiter_isEnabled) {
-            limiter_handleDeletedMessage();
         }
     });
 
@@ -1354,3 +1567,16 @@ jQuery(async () => {
         setTimeout(initializeExtension, initialDelay); // 使用相同的 initializeExtension 函数作为回退
     }
 });
+
+// 兜底拦截：在 API 请求前硬性截断 chat 数组，确保只有最近 N 条消息被发送
+globalThis.HideHelper_interceptGeneration = function (chat) {
+    const settings = extension_settings[extensionName];
+    if (!settings?.enabled) return;
+
+    const hideSettings = getCurrentHideSettings();
+    if (!hideSettings?.userConfigured || hideSettings.hideLastN <= 0) return;
+
+    while (chat.length > hideSettings.hideLastN) {
+        chat.shift();
+    }
+};

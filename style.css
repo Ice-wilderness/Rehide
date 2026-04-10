@@ -573,3 +573,272 @@ input:checked + .hide-helper-slider:before {
     border: 1px solid var(--border-color);
     background-color: var(--background-secondary); /* 添加背景色以防视频加载慢时出现空白 */
 }
+
+/* ==================== 聊天统计 (Token Stats) 样式 ==================== */
+
+/* 统计面板容器 */
+#token-stats-panel .tub-body {
+    padding: 0 25px 0 0 !important; /* 修改：原本是0，改为在右侧留出 25px 空间 */
+    margin-right: -25px !important; /* 新增：利用负边距使滚动容器完全贴合到弹窗的最右侧内壁 */
+    overflow-x: hidden !important;
+    max-height: 50vh;
+}
+
+#token-stats-panel .tub-title-text,
+#token-stats-panel .tub-stat-value {
+    color: var(--text-primary) !important;
+    font-weight: bold !important;
+}
+
+#token-stats-panel .tub-body,
+#token-stats-panel .tub-stat-label,
+#token-stats-panel .tub-legend,
+#token-stats-panel .tub-section-title {
+    color: var(--text-secondary) !important;
+}
+
+/* 概览行 */
+#token-stats-panel .tub-row-1 {
+    display: grid !important;
+    grid-template-columns: repeat(4, 1fr) !important;
+    gap: 10px !important;
+    margin-bottom: 20px !important;
+}
+
+#token-stats-panel .tub-stat-box {
+    background: var(--background-secondary) !important;
+    border: none !important;
+    border-radius: 10px !important;
+    padding: 12px 5px !important;
+    text-align: center !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    gap: 5px !important;
+}
+
+#token-stats-panel .tub-stat-value {
+    font-size: 1.1em !important;
+}
+
+#token-stats-panel .tub-stat-label {
+    font-size: 0.75em !important;
+    opacity: 0.9 !important;
+}
+
+#token-stats-panel .tub-stat-box small {
+    color: var(--text-secondary) !important;
+}
+
+/* 饼图行 */
+#token-stats-panel .tub-row-2 {
+    background: var(--background-secondary) !important;
+    border: none !important;
+    border-radius: 10px !important;
+    padding: 20px !important;
+    margin-bottom: 20px !important;
+    display: flex !important;
+    flex-direction: row !important;
+    justify-content: center !important;
+    align-items: center !important;
+    gap: 40px !important;
+    padding-right: 40px !important;
+}
+
+#token-stats-panel .tub-pie-chart {
+    width: 100px !important;
+    height: 100px !important;
+    border-radius: 50% !important;
+    margin-bottom: 0 !important;
+    position: relative !important;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.05) !important;
+    flex-shrink: 0 !important;
+}
+
+#token-stats-panel .tub-pie-text {
+    position: absolute !important;
+    transform: translate(-50%, -50%) !important;
+    color: #ffffff !important;
+    font-size: 11px !important;
+    font-weight: bold !important;
+    text-shadow: 0px 1px 2px rgba(0,0,0,0.4) !important;
+    pointer-events: none !important;
+}
+
+#token-stats-panel .tub-legend {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 12px !important;
+    font-size: 0.85em !important;
+}
+
+#token-stats-panel .tub-dot {
+    display: inline-block !important;
+    width: 10px !important;
+    height: 10px !important;
+    border-radius: 50% !important;
+    margin-right: 8px !important;
+}
+#token-stats-panel .tub-dot-blue { background: #3b82f6 !important; }
+#token-stats-panel .tub-dot-green { background: #22c55e !important; }
+
+/* 条目列表区域 */
+#token-stats-panel .tub-row-3 {
+    max-height: 250px !important;
+    padding-right: 25px !important; /* 修改：增加内边距来抵消外边距 */
+    margin-right: -25px !important; /* 新增：使内部的列表容器也延展到弹窗最右侧 */
+    position: relative !important;
+}
+
+#token-stats-panel .tub-row-3 > * {
+    direction: ltr !important;
+}
+
+/* --- 聊天统计面板：原生滚动条美化与动态显示控制 --- */
+#token-stats-panel .tub-scrollable {
+    overflow-y: auto !important; /* 修复：将废弃的 overlay 改为 auto */
+    scrollbar-width: thin !important; /* Firefox: 变细，不再设为 none */
+    scrollbar-color: rgba(148, 0, 211, 0.3) transparent !important; /* Firefox: 滑块颜色和轨道透明 */
+}
+
+/* WebKit (Chrome, Safari, Edge) 原生滚动条美化 */
+#token-stats-panel .tub-scrollable::-webkit-scrollbar {
+    width: 6px !important;
+    background: transparent !important;
+}
+
+/* 核心目标：彻底隐藏上下倒三角箭头 */
+#token-stats-panel .tub-scrollable::-webkit-scrollbar-button {
+    display: none !important;
+    width: 0 !important;
+    height: 0 !important;
+}
+
+#token-stats-panel .tub-scrollable::-webkit-scrollbar-track {
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+}
+
+/* 滑块默认状态：给予一个半透明的淡紫色，而不是 transparent */
+#token-stats-panel .tub-scrollable::-webkit-scrollbar-thumb {
+    background-color: rgba(148, 0, 211, 0.3) !important;
+    border-radius: 3px !important;
+    border: none !important;
+}
+
+/* 鼠标悬停在滑块上时加深颜色 */
+#token-stats-panel .tub-scrollable::-webkit-scrollbar-thumb:hover {
+    background-color: rgba(148, 0, 211, 0.6) !important;
+}
+
+/* 过滤按钮 */
+#token-stats-panel .tub-book-filters {
+    display: flex !important;
+    flex-wrap: wrap !important;
+    gap: 6px !important;
+    margin-bottom: 15px !important;
+}
+
+#token-stats-panel .tub-book-btn {
+    background: var(--background-secondary) !important;
+    border: none !important;
+    color: var(--text-secondary) !important;
+    padding: 5px 12px !important;
+    border-radius: 15px !important;
+    font-size: 0.75em !important;
+    cursor: pointer !important;
+    transition: all 0.2s !important;
+    font-weight: 500 !important;
+}
+
+#token-stats-panel .tub-book-btn:hover {
+    background: var(--btn-secondary-hover-bg) !important;
+    color: var(--text-primary) !important;
+}
+
+#token-stats-panel .tub-book-btn.active {
+    background: var(--text-primary) !important;
+    color: #ffffff !important;
+}
+
+/* 搜索框 */
+#token-stats-panel .tub-search-wrapper {
+    display: flex !important;
+    align-items: center !important;
+    gap: 5px !important;
+    position: relative !important;
+}
+
+#token-stats-panel .tub-search-icon {
+    cursor: pointer !important;
+    color: var(--text-secondary) !important;
+    transition: color 0.2s !important;
+}
+
+#token-stats-panel .tub-search-icon:hover {
+    color: var(--accent-color) !important;
+}
+
+#token-stats-panel .tub-search-input {
+    width: 0 !important;
+    opacity: 0 !important;
+    padding: 0 !important;
+    border: none !important;
+    border-bottom: 2px solid var(--accent-color) !important;
+    outline: none !important;
+    background: transparent !important;
+    font-size: 0.8em !important;
+    color: var(--text-primary) !important;
+    transition: width 0.3s ease, opacity 0.3s ease, padding 0.3s ease !important;
+    pointer-events: none !important;
+}
+
+#token-stats-panel .tub-search-input.active {
+    width: 120px !important;
+    opacity: 1 !important;
+    padding: 2px 5px !important;
+    pointer-events: auto !important;
+}
+
+/* 列表项样式 */
+#token-stats-panel .tub-new-list-item {
+    display: flex !important;
+    justify-content: space-between !important;
+    align-items: center !important;
+    padding: 6px 15px !important;
+    border-radius: 8px !important;
+    margin-bottom: 8px !important;
+    color: var(--text-primary) !important;
+    font-weight: 500 !important;
+    font-size: 0.9em !important;
+    cursor: pointer !important;
+    transition: transform 0.2s cubic-bezier(0.25, 0.8, 0.25, 1), box-shadow 0.2s cubic-bezier(0.25, 0.8, 0.25, 1) !important;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.02) !important;
+    user-select: none !important;
+    direction: ltr !important;
+}
+
+#token-stats-panel .tub-nli-label {
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    max-width: 80% !important;
+}
+
+#token-stats-panel .tub-nli-value {
+    font-weight: bold !important;
+    font-size: 1.05em !important;
+}
+
+#token-stats-panel .tub-new-list-item:hover {
+    transform: translateY(-2px) !important;
+    box-shadow: 0 6px 12px rgba(0,0,0,0.08) !important;
+}
+
+#token-stats-panel .tub-new-list-item:active {
+    transform: translateY(1px) !important;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.04) !important;
+}
+
+/* ==================== 聊天统计样式结束 ==================== */
