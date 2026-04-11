@@ -13,6 +13,8 @@ const extensionName = "hide";
 const defaultSettings = {
     // 全局默认设置
     enabled: true,
+    // 自动隐藏功能总开关
+    autoHideEnabled: true,
     // 用于存储每个实体设置的对象
     settings_by_entity: {},
     // 迁移标志
@@ -20,7 +22,7 @@ const defaultSettings = {
     // 添加全局设置相关字段
     useGlobalSettings: false,
     globalHideSettings: {
-        hideLastN: 0,
+        hideLastN: null,
         lastProcessedLength: 0,
         userConfigured: false
     },
@@ -46,51 +48,24 @@ let isSTPTInterceptorSetup = false;
 function setupSTPTInterceptor() {
     if (isSTPTInterceptorSetup) return;
 
-    // 破绽一：劫持全局 ejs 编译器 (获取精准渲染后的 Tokens)
-    if (typeof window !== 'undefined' && window.ejs && window.ejs.compile && !window.ejs._isHookedByHideHelper) {
-        const originalCompile = window.ejs.compile;
-        window.ejs.compile = function(template, opts) {
-            const compiledFunc = originalCompile.apply(this, arguments);
-            // 包装返回的执行函数
-            return function(data) {
-                const result = compiledFunc.apply(this, arguments);
-                // 检查上下文里是否带有世界书数据
-                if (data && data.world_info && result.trim() !== '') {
-                    stptInterceptedEntries.push({
-                        world: data.world_info.world || 'ST-PT 注入',
-                        comment: data.world_info.comment || '未命名条目',
-                        renderedText: result // 精确渲染结果
-                    });
-                }
-                return result;
-            };
-        };
-        window.ejs._isHookedByHideHelper = true;
-        Logger.success('成功挂载 EJS 编译器劫持 (ST-PT 拦截器 A)');
-    }
-
-    // 破绽二：利用 prompt_template_prepare 事件设置 Setter 陷阱 (获取原始文本，作为兜底)
+    // 采用安全拦截方案：监听 ST-PT 准备渲染上下文的事件
+    // 避开直接劫持 ejs.compile，防止 ST-PT 沙箱序列化函数时丢失作用域导致报错
     if (typeof eventSource !== 'undefined') {
         eventSource.on('prompt_template_prepare', (env) => {
-            let currentWi = env.world_info;
-            Object.defineProperty(env, 'world_info', {
-                get() { return currentWi; },
-                set(val) {
-                    currentWi = val;
-                    if (val && val.comment) {
-                        stptInterceptedEntries.push({
-                            world: val.world || 'ST-PT 注入',
-                            comment: val.comment || '未命名条目',
-                            rawText: val.content, // 原始模板内容
-                            isRaw: true
-                        });
-                    }
-                },
-                enumerable: true,
-                configurable: true
-            });
+            // 当 ST-PT 准备渲染某个条目时，会将条目数据放入 env.world_info
+            if (env && env.world_info && env.world_info.comment) {
+                const val = env.world_info;
+
+                // 记录拦截到的条目，用于后续 Token 统计校准
+                stptInterceptedEntries.push({
+                    world: val.world || 'ST-PT 注入',
+                    comment: val.comment || '未命名条目',
+                    rawText: val.content || '', // 原始模板内容
+                    isRaw: true
+                });
+            }
         });
-        Logger.success('成功挂载上下文 Setter 陷阱 (ST-PT 拦截器 B)');
+        Logger.success('成功挂载 ST-PT 渲染监听器 (安全拦截模式)');
     }
 
     isSTPTInterceptorSetup = true;
@@ -99,17 +74,14 @@ function setupSTPTInterceptor() {
 // DOM元素缓存
 const domCache = {
     hideLastNInput: null,
-    saveBtn: null,
     currentValueDisplay: null,
     // 初始化缓存
     init() {
         Logger.debug('初始化 DOM 缓存...');
         this.hideLastNInput = document.getElementById('hide-last-n');
-        this.saveBtn = document.getElementById('hide-save-settings-btn');
         this.currentValueDisplay = document.getElementById('hide-current-value');
         Logger.debug('DOM 缓存已初始化:', {
             hideLastNInput: !!this.hideLastNInput,
-            saveBtn: !!this.saveBtn,
             currentValueDisplay: !!this.currentValueDisplay
         });
     }
@@ -415,6 +387,7 @@ function createInputWandButton() {
 function createPopup() {
     Logger.debug('创建弹出对话框');
     const popupHtml = `
+        <div id="hide-helper-backdrop" class="hide-helper-backdrop"></div>
         <div id="hide-helper-popup" class="hide-helper-popup">
             <button id="hide-helper-popup-close-icon" class="hide-helper-popup-close-icon">&times;</button>
 
@@ -430,12 +403,21 @@ function createPopup() {
             <div class="popup-tabs-content">
                 <!-- 面板1: 隐藏楼层 -->
                 <div id="hide-panel" class="tab-panel active" data-tab="hide-panel">
-                    <div class="hide-helper-section">
-                        <label for="hide-last-n" class="hide-helper-label">保留最新的N条消息，并隐藏其余旧楼层</label>
-                        <input type="number" id="hide-last-n" min="0" placeholder="例如: 10">
+                    <!-- 新增：功能总开关 -->
+                    <div class="limiter-setting-item">
+                        <label for="hide-auto-process-toggle">启用隐藏楼层功能</label>
+                        <div class="hide-helper-checkbox-container">
+                            <input id="hide-auto-process-toggle" type="checkbox">
+                            <label for="hide-auto-process-toggle"></label>
+                        </div>
+                    </div>
+
+                    <div class="hide-helper-section hide-last-n-section">
+                        <label class="hide-helper-label">保留最新的N条消息，并隐藏其余旧楼层</label>
+                        <input type="number" id="hide-last-n" min="0" placeholder="" class="hide-last-n-input">
                     </div>
                     <div class="hide-helper-current">
-                        <strong>当前保留楼层数:</strong>
+                        <strong id="hide-status-text">当前保留楼层数:</strong>
                         <span id="hide-current-value">无</span>
                     </div>
                     <div class="hide-helper-mode-switch">
@@ -448,20 +430,61 @@ function createPopup() {
                             <span class="hide-helper-slider"></span>
                         </label>
                     </div>
-                    <div class="hide-helper-popup-footer">
-                        <button id="hide-save-settings-btn" class="hide-helper-btn">
-                            <i class="fa-solid fa-save"></i> 保存设置
-                        </button>
+                    <div class="hide-helper-popup-footer" style="display: flex; justify-content: center;">
                         <button id="hide-unhide-all-btn" class="hide-helper-btn">
-                            <i class="fa-solid fa-eye"></i> 取消隐藏
+                            <i class="fa-solid fa-eye-slash"></i> 立即将当前聊天所有楼层取消隐藏
                         </button>
+                    </div>
+
+                    <!-- 功能说明区域 -->
+                    <div class="hide-panel-instructions">
+                        <h3>功能说明</h3>
+                        <div class="instructions-content">
+                            <p class="important-note"><strong>启用该隐藏楼层功能后，酒馆将始终只发送最近N条楼层给AI，而N条目楼层之外的消息将会始终自动隐藏。</strong></p>
+                            <p><strong>1. 前提说明</strong></p>
+                            <p>在使用"自动隐藏"功能前，请务必确认以下配置：</p>
+                            <ul>
+                                <li><strong>必要操作</strong>：必须勾选 <strong>【启用隐藏楼层功能】</strong> 并设置 <strong>【保留的楼层数 N】</strong>，否则功能不会生效。</li>
+                                <li><strong>功能独立性</strong>：插件包含【隐藏楼层】、【限制楼层】和【聊天统计】三个核心功能。它们之间相互独立，互不影响。</li>
+                                <li>若只想使用【限制楼层】和【聊天统计】，只需<strong>不勾选</strong>【启用隐藏楼层功能】即可。</li>
+                            </ul>
+
+                            <p><strong>2. 使用说明</strong></p>
+                            <p>设置保留楼层数 <strong>N</strong> 并启用功能后，插件会始终自动隐藏最近 N 楼之外的所有消息。</p>
+                            <ul>
+                                <li><strong>示例</strong>：设置保留最近 <strong>1</strong> 楼。</li>
+                                <li><strong>效果</strong>：若当前共有第 0 楼至第 9 楼消息，插件将自动隐藏第 0 至第 8 楼，仅将最新的第 9 楼消息发送给 AI。</li>
+                            </ul>
+
+                            <p><strong>3. 立即将当前聊天所有楼层取消隐藏</strong></p>
+                            <p>点击此按钮将执行以下操作：</p>
+                            <ol>
+                                <li>立即取消当前聊天中所有楼层的隐藏状态。</li>
+                                <li>清空【保留的楼层数 N】的数值。</li>
+                                <li><strong>结果</strong>：自动隐藏功能将处于不生效状态。</li>
+                            </ol>
+
+                            <p><strong>4. 模式选择</strong></p>
+                            <p>插件提供两种配置模式，建议根据使用习惯选择：</p>
+                            <ul>
+                                <li><strong>全局模式（推荐）</strong>：只需设置一次【保留的楼层数】。该数值将应用于所有角色，切换角色无需重新配置，简单方便。</li>
+                                <li><strong>角色模式</strong>：需要为每个角色卡单独设置【保留的楼层数】。注意：若某个角色未设置数值（数值为空），则该角色的自动隐藏功能不会生效。</li>
+                            </ul>
+
+                            <p><strong>5. 注意事项与兼容性</strong></p>
+                            <ul>
+                                <li><strong>正则冲突</strong>：该功能与"隐藏楼层正则"冲突，请确保仅开启其中一个。</li>
+                                <li><strong>插件冲突</strong>：若其他插件/脚本也具备自动隐藏功能，请仅启用其中一个，避免运行逻辑打架。</li>
+                                <li><strong>核心原理</strong>：在没有其他脚本干预的情况下，本插件能确保仅发送最近 N 条消息。除了执行隐藏操作外，插件还会从底层<strong>直接截断发送的上下文</strong>，从根本上保证发送的消息层数符合设定。</li>
+                            </ul>
+                        </div>
                     </div>
                 </div>
 
                 <!-- 面板2: 限制楼层 -->
                 <div id="limiter-panel" class="tab-panel" data-tab="limiter-panel">
                     <div class="limiter-setting-item">
-                        <label for="limiter-enabled">启用消息楼层限制</label>
+                        <label for="limiter-enabled">启用限制楼层功能</label>
                         <div class="hide-helper-checkbox-container">
                             <input id="limiter-enabled" type="checkbox">
                             <label for="limiter-enabled"></label>
@@ -472,7 +495,7 @@ function createPopup() {
                         <input id="limiter-count" type="number" class="text_pole" min="0" max="1000" step="5" placeholder="例如: 20">
                     </div>
                     <div class="limiter-description">
-                        该功能会实时动态限制聊天界面加载的消息楼层数量，以减少酒馆卡顿，提高流畅度。建议加载的消息楼层数量不要超过20。没有加载（且也未被隐藏）的楼层消息依然会被当做上下文发送给AI。该功能实际上和酒馆原生的【要渲染 # 条消息】是同一个接口，因此和酒馆或酒馆助手以及鸡尾酒插件的“限制消息加载”功能不会冲突。
+                        该功能会实时动态限制聊天界面加载的消息楼层数量，以减少酒馆卡顿，提高流畅度。建议设置的【加载的消息楼层数量】不要超过20。没有加载（且也未被隐藏）的楼层消息依然会被当做上下文发送给AI。该功能实际上和酒馆原生的【要渲染 # 条消息】是同一个接口，因此和酒馆或酒馆助手以及鸡尾酒插件的“限制消息加载”功能不会冲突。
                     </div>
                 </div>
 
@@ -510,10 +533,10 @@ function createPopup() {
                             <i class="fa-solid fa-shield-halved"></i> <strong>双重保护机制：</strong>本插件同时使用“消息隐藏”和“请求拦截”两种方式确保旧消息不会被发送给AI。即使某些消息楼层因特殊原因未能生效（例如被其他插件/脚本的隐藏功能覆盖），拦截机制仍会在API请求发出前强制截断消息列表，作为最终兜底保障，确保实际上发送的消息楼层真的只有最近N条消息楼层。
                         </p>
                         <p>
-                            在输入框中填入您想 <strong>保留的最新消息数量</strong> (例如 <code>4</code>)，然后点击 <span class="button-like">保存设置</span> 按钮。插件便会立即生效，隐藏设定范围之外的所有内容。
+                            在输入框中填入您想 <strong>保留的最新消息楼层数量</strong> (例如 <code>4</code>)，然后点击 <span class="button-like">保存设置</span> 按钮。插件便会立即生效，隐藏设定范围之外的所有内容。
                         </p>
                         <p>
-                            <strong>示例：</strong> 假设当前聊天共有10条消息。您输入 <code>4</code> 并保存，则最新的4条消息会正常显示并发送给AI，而之前的6条消息将被隐藏。当您或AI发送新消息后，插件会自动调整，确保始终只有最新的4条消息是可见的。
+                            <strong>示例：</strong> 假设当前聊天共有10条消息。您输入 <code>4</code> 并保存，则最新的4条消息会发送给AI，而之前的6条消息将不会发生给AI。当您或AI发送新消息后，插件会自动调整，确保始终只有最新的4条消息是未隐藏的，而之前的消息楼层则始终是隐藏的。
                         </p>
                         <h3>全局模式 vs 角色模式</h3>
                         <p>
@@ -525,10 +548,10 @@ function createPopup() {
                         </p>
                          <h3>取消隐藏</h3>
                          <p>
-                            点击 <span class="button-like">取消隐藏</span> 按钮后，插件会立刻将当前模式（全局或角色）的隐藏设置重置为0，此时所有被隐藏的楼层都会重新显示。
+                            点击 <span class="button-like">取消隐藏</span> 按钮后，插件会立刻将当前聊天的楼层全部取消楼层一遍，并且将保留楼层的N值置空，置空状态下自动隐藏功能将不会生效。
                         </p>
                         <p class="important">
-                            <i class="fa-solid fa-circle-info"></i> 被隐藏的消息 <strong>不会</strong> 被包含在发送给AI的上下文中。这意味着AI无法“看到”这些内容，这对于控制上下文长度和引导对话非常有帮助。
+                            <i class="fa-solid fa-circle-info"></i> 被隐藏的消息 <strong>不会</strong> 被包含在发送给AI的上下文中。这意味着AI无法“看到”这些N楼之前的消息，这对于控制上下文长度和节省tokens非常有帮助。
                         </p>
 
                         <h2>限制楼层 (功能2)</h2>
@@ -586,7 +609,7 @@ function saveCurrentHideSettings(hideLastN) {
     Logger.debug(`当前聊天长度=${chatLength}`);
 
     const settingsToSave = {
-        hideLastN: hideLastN >= 0 ? hideLastN : 0,
+        hideLastN: (hideLastN !== null && hideLastN > 0) ? hideLastN : null, // 存储为 null 表示禁用
         lastProcessedLength: chatLength,
         userConfigured: true
     };
@@ -623,18 +646,31 @@ function saveCurrentHideSettings(hideLastN) {
 function updateCurrentHideSettingsDisplay() {
     Logger.debug('更新隐藏设置显示');
 
-    // --- 更新 Hide 面板 ---
+    const settings = extension_settings[extensionName];
     const currentHideSettings = getCurrentHideSettings();
-    Logger.debug('读取的隐藏设置:', currentHideSettings);
+    const $statusText = $('#hide-status-text');
+    const $valueDisplay = $('#hide-current-value');
+    const $input = $('#hide-last-n');
 
-    if (domCache.currentValueDisplay) {
-        const displayValue = (currentHideSettings && currentHideSettings.hideLastN > 0) ? currentHideSettings.hideLastN : '所有楼层均不隐藏';
-        domCache.currentValueDisplay.textContent = displayValue;
+    // 更新功能总开关状态
+    $('#hide-auto-process-toggle').prop('checked', settings.autoHideEnabled ?? true);
+
+    // 逻辑判定文案
+    if (!(settings.autoHideEnabled ?? true)) {
+        $statusText.text("自动隐藏楼层功能已禁用");
+        $valueDisplay.text("");
+    } else if (!currentHideSettings?.hideLastN || currentHideSettings.hideLastN <= 0) {
+        $statusText.text("当前未设置保留值N，自动隐藏不会生效");
+        $valueDisplay.text("");
+    } else {
+        $statusText.text("当前保留楼层数:");
+        $valueDisplay.text(currentHideSettings.hideLastN);
     }
-    if (domCache.hideLastNInput) {
-        const inputValue = currentHideSettings?.hideLastN > 0 ? currentHideSettings.hideLastN : '';
-        domCache.hideLastNInput.value = inputValue;
-    }
+
+    // 更新输入框 (0 或空都显示为空)
+    $input.val(currentHideSettings?.hideLastN > 0 ? currentHideSettings.hideLastN : '');
+
+    // 更新模式切换 UI
     const useGlobal = extension_settings[extensionName]?.useGlobalSettings || false;
     $('#hide-mode-toggle').prop('checked', useGlobal);
     $('#hide-mode-label').text(useGlobal ? '全局模式' : '角色模式');
@@ -646,7 +682,7 @@ function updateCurrentHideSettingsDisplay() {
     if (isNaN(nativeTruncation) || nativeTruncation <= 0) {
         nativeTruncation = power_user.chat_truncation || 0;
     }
-    
+
     $('#limiter-enabled').prop('checked', extension_settings[extensionName].limiter_isEnabled);
     // 有效值则显示，为 0 时设为空字符串，使其平滑回落到 placeholder 的提示
     $('#limiter-count').val(nativeTruncation > 0 ? nativeTruncation : '');
@@ -672,21 +708,41 @@ function debounce(fn, delay) {
 // 防抖版本的全量检查
 const runFullHideCheckDebounced = debounce(runFullHideCheck, 200);
 
+// 自动保存防抖
+const saveSettingsAutoDebounced = debounce(() => {
+    const val = parseInt($('#hide-last-n').val());
+    if (val > 0) {
+        saveCurrentHideSettings(val);
+        runFullHideCheckDebounced();
+        updateCurrentHideSettingsDisplay();
+    } else if (val === 0) {
+        unhideAllMessages(true);
+    } else {
+        // 输入为空
+        saveCurrentHideSettings(null);
+        updateCurrentHideSettingsDisplay();
+    }
+}, 800);
+
 // 检查是否应该执行隐藏/取消隐藏操作
 function shouldProcessHiding() {
     Logger.debug('检查是否应该处理隐藏');
-    if (!extension_settings[extensionName]?.enabled) {
-        Logger.debug('插件已禁用，返回 false');
+    const mainEnabled = extension_settings[extensionName]?.enabled; // 扩展总开关
+    const autoHideEnabled = extension_settings[extensionName]?.autoHideEnabled ?? true; // 隐藏功能开关
+
+    if (!mainEnabled || !autoHideEnabled) {
+        Logger.debug(`插件或自动隐藏功能已禁用 (mainEnabled=${mainEnabled}, autoHideEnabled=${autoHideEnabled})，返回 false`);
         return false;
     }
 
     const settings = getCurrentHideSettings();
     Logger.debug('当前实体的设置:', settings);
-    if (!settings || settings.userConfigured !== true) {
-        Logger.debug('未找到用户配置的设置，返回 false');
+    // 如果没有配置，或者 hideLastN 是 null/undefined/NaN/0，则不进行自动隐藏处理
+    if (!settings || !settings.userConfigured || !settings.hideLastN || settings.hideLastN <= 0) {
+        Logger.debug('未找到有效的用户配置或隐藏值为空/0，返回 false');
         return false;
     }
-    Logger.debug('插件已启用且找到用户配置，返回 true');
+    Logger.debug('插件已启用且找到有效用户配置，返回 true');
     return true;
 }
 
@@ -895,82 +951,52 @@ async function runFullHideCheck() {
 }
 
 // 全部取消隐藏功能
-async function unhideAllMessages() {
+async function unhideAllMessages(isFromInputZero = false) {
     const startTime = performance.now();
     Logger.debug('开始取消所有隐藏');
     const context = getContextOptimized();
 
-    if (!context || !context.chat) {
-         Logger.debug('聊天数据不可用');
+    if (context?.chat) {
+        const chat = context.chat;
+        const chatLength = chat.length;
+        const toShow = [];
 
-         // 即使没有聊天数据，也尝试重置隐藏设置
-         if (extension_settings[extensionName].useGlobalSettings) {
-             Logger.debug('重置全局隐藏设置为 0');
-             extension_settings[extensionName].globalHideSettings.hideLastN = 0;
-             extension_settings[extensionName].globalHideSettings.userConfigured = true;
-             saveSettingsDebounced();
-             updateCurrentHideSettingsDisplay();
-         } else {
-             const entityId = getCurrentEntityId();
-             if (entityId) {
-                 Logger.debug(`重置实体 ${entityId} 的隐藏设置为 0`);
-                 saveCurrentHideSettings(0);
-                 updateCurrentHideSettingsDisplay();
-             } else {
-                 Logger.error('无法确定实体 ID 来重置设置');
-                 toastr.error('无法取消隐藏：无法确定当前目标。');
-             }
-         }
-         return;
-    }
-
-    const chat = context.chat;
-    const chatLength = chat.length;
-    Logger.debug(`聊天长度: ${chatLength}`);
-
-    const toShow = [];
-    Logger.debug('扫描聊天中的隐藏消息...');
-    for (let i = 0; i < chatLength; i++) {
-        if (chat[i] && chat[i].is_system === true && chat[i].hide_helper_hidden === true) {
-            Logger.debug(`发现插件隐藏消息 ${i}，标记为显示`);
-            toShow.push(i);
-        }
-    }
-    Logger.debug(`找到 ${toShow.length} 条需取消隐藏的消息`);
-
-    if (toShow.length > 0) {
-        Logger.debug('更新聊天数组数据...');
-        toShow.forEach(idx => {
-            if (chat[idx]) {
-                chat[idx].is_system = false;
-                delete chat[idx].hide_helper_hidden;
+        for (let i = 0; i < chatLength; i++) {
+            if (chat[i] && chat[i].is_system === true && chat[i].hide_helper_hidden === true) {
+                toShow.push(i);
             }
-        });
-        Logger.debug('聊天数据已更新');
-        try {
-            Logger.debug('更新 DOM...');
-            const showSelector = toShow.map(id => `.mes[mesid="${id}"]`).join(',');
-            if (showSelector) {
-                 Logger.debug(`应用选择器: ${showSelector}`);
-                 $(showSelector).attr('is_system', 'false');
-                 Logger.debug('DOM 已更新');
-            }
-        } catch (error) {
-            Logger.error('取消隐藏时更新 DOM 发生错误:', error);
         }
-    } else {
-        Logger.info('未找到需要取消隐藏的消息');
+
+        if (toShow.length > 0) {
+            toShow.forEach(idx => {
+                if (chat[idx]) {
+                    chat[idx].is_system = false;
+                    delete chat[idx].hide_helper_hidden;
+                }
+            });
+            try {
+                const showSelector = toShow.map(id => `.mes[mesid="${id}"]`).join(',');
+                if (showSelector) {
+                     $(showSelector).attr('is_system', 'false');
+                }
+            } catch (error) {
+                Logger.error('取消隐藏时更新 DOM 发生错误:', error);
+            }
+        }
+        Logger.debug('已取消所有插件系统标记');
     }
 
-    Logger.debug('保存隐藏设置为 0');
-    const success = saveCurrentHideSettings(0);
-    if (success) {
-        Logger.success('隐藏设置已重置为 0');
-        updateCurrentHideSettingsDisplay();
+    // 将设置设为空/禁用状态
+    saveCurrentHideSettings(null);
+
+    if (isFromInputZero) {
+        toastr.success('隐藏值已设置为0，立即取消当前所有隐藏楼层');
     } else {
-        Logger.error('重置隐藏设置命令失败');
+        toastr.success('已立即取消当前所有楼层隐藏');
     }
-     Logger.info(`取消隐藏完成，耗时 ${performance.now() - startTime}ms`);
+
+    updateCurrentHideSettingsDisplay();
+    Logger.info(`取消隐藏完成，耗时 ${performance.now() - startTime}ms`);
 }
 
 // ==================== 聊天统计 (Token Stats) 功能 ====================
@@ -1289,9 +1315,9 @@ function setupEventListeners() {
         // 2. 处理刚才拦截到的 ST-PT 条目 (去重)
         const processedSTPT = new Map();
         for (const entry of stptInterceptedEntries) {
+            // 使用世界书名和条目备注作为唯一键进行去重
             const key = `${entry.world}::${entry.comment}`;
-            // 优先保留 renderedText，所以 rawText 只有在没被截获时才录入
-            if (!processedSTPT.has(key) || !entry.isRaw) {
+            if (!processedSTPT.has(key)) {
                 processedSTPT.set(key, entry);
             }
         }
@@ -1301,7 +1327,7 @@ function setupEventListeners() {
 
         // 计算拦截条目的 Tokens
         for (const entry of processedSTPT.values()) {
-            const textToMeasure = entry.renderedText || entry.rawText || '';
+            const textToMeasure = entry.rawText || '';
             if (textToMeasure.trim() === '') continue;
 
             const tk = await getTokenCountAsync(textToMeasure);
@@ -1431,6 +1457,8 @@ function setupEventListeners() {
         updateTokenStatsUI();
 
         const $popup = $('#hide-helper-popup');
+        const $backdrop = $('#hide-helper-backdrop');
+        $backdrop.show();
         $popup.show();
         centerPopup($popup);
         $(window).off('resize.hideHelperMain').on('resize.hideHelperMain', () => centerPopup($popup));
@@ -1439,6 +1467,15 @@ function setupEventListeners() {
     $('#hide-helper-popup-close-icon').on('click', function() {
         Logger.debug('弹窗关闭图标被点击');
         $('#hide-helper-popup').hide();
+        $('#hide-helper-backdrop').hide();
+        $(window).off('resize.hideHelperMain');
+    });
+
+    // 点击遮罩层关闭弹窗
+    $('#hide-helper-backdrop').on('click', function() {
+        Logger.debug('遮罩层被点击，关闭弹窗');
+        $('#hide-helper-popup').hide();
+        $('#hide-helper-backdrop').hide();
         $(window).off('resize.hideHelperMain');
     });
 
@@ -1479,6 +1516,16 @@ function setupEventListeners() {
 
     // --- 面板1: Hide 设置 ---
 
+    // 1. 新增：功能总开关切换
+    $('#hide-auto-process-toggle').on('change', function() {
+        extension_settings[extensionName].autoHideEnabled = $(this).is(':checked');
+        saveSettingsDebounced();
+        updateCurrentHideSettingsDisplay();
+        if (extension_settings[extensionName].autoHideEnabled) {
+            runFullHideCheckDebounced();
+        }
+    });
+
     $('#hide-mode-toggle').on('change', function() {
         const newMode = $(this).is(':checked');
 
@@ -1496,65 +1543,22 @@ function setupEventListeners() {
         }
     });
 
-    const hideLastNInput = document.getElementById('hide-last-n');
-    if (hideLastNInput) {
-        Logger.debug('为 #hide-last-n 设置输入监听器');
-        hideLastNInput.addEventListener('input', (e) => {
-            const value = parseInt(e.target.value);
-             Logger.debug(`输入字段变化: "${e.target.value}", 解析值: ${value}`);
-            if (isNaN(value) || value < 0) {
-                 Logger.debug('输入无效或负数，清空输入字段');
-                 e.target.value = '';
-            } else {
-                 Logger.debug(`输入有效，保留值: ${value}`);
-                 e.target.value = value;
-            }
-        });
-    } else {
-        Logger.warn('未找到 #hide-last-n 输入元素');
-    }
+    // 2. 修改：输入框失去焦点时才保存，避免输入过程中频繁触发保存
+    $('#hide-last-n').on('blur', function() {
+        saveSettingsAutoDebounced();
+    });
 
-    $('#hide-save-settings-btn').on('click', function() {
-        Logger.debug('保存设置按钮被点击');
-        const value = parseInt(hideLastNInput.value);
-        const valueToSave = isNaN(value) || value < 0 ? 0 : value;
-         Logger.debug(`解析输入值: ${value}, 要保存的值: ${valueToSave}`);
-
-        const currentSettings = getCurrentHideSettings();
-        const currentValue = currentSettings?.hideLastN || 0;
-         Logger.debug(`当前保存的值: ${currentValue}`);
-
-        if (valueToSave !== currentValue) {
-            Logger.info(`值从 ${currentValue} 变更为 ${valueToSave}，开始保存`);
-            const $btn = $(this);
-            const originalText = $btn.text();
-            $btn.text('保存中...').prop('disabled', true);
-
-            Logger.debug(`调用 saveCurrentHideSettings(${valueToSave})`);
-            const success = saveCurrentHideSettings(valueToSave);
-             Logger.debug(`saveCurrentHideSettings 返回: ${success}`);
-
-            if (success) {
-                Logger.debug('保存指令已成功发出，运行全量检查并更新显示');
-                runFullHideCheck();
-                updateCurrentHideSettingsDisplay();
-                toastr.success('隐藏设置已保存');
-            } else {
-                 Logger.error('保存指令失败');
-            }
-
-            Logger.debug('恢复按钮状态');
-            $btn.text(originalText).prop('disabled', false);
-        } else {
-            Logger.debug(`值 (${valueToSave}) 未变化，跳过保存`);
-            toastr.info('设置未更改');
+    // 回车键让输入框失去焦点，触发保存
+    $('#hide-last-n').on('keydown', function(e) {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            this.blur(); // 失去焦点会触发 blur 事件进而保存
         }
     });
 
-    $('#hide-unhide-all-btn').on('click', async function() {
-        Logger.debug('取消隐藏按钮被点击');
-        await unhideAllMessages();
-        Logger.debug('取消隐藏过程完成');
+    // 3. 修改：取消隐藏按钮
+    $('#hide-unhide-all-btn').on('click', function() {
+        unhideAllMessages(false);
     });
 
     // --- 面板2: Limiter 设置 ---
@@ -1723,8 +1727,11 @@ globalThis.HideHelper_interceptGeneration = function (chat) {
     const settings = extension_settings[extensionName];
     if (!settings?.enabled) return;
 
+    const autoHideEnabled = settings.autoHideEnabled ?? true;
+    if (!autoHideEnabled) return;
+
     const hideSettings = getCurrentHideSettings();
-    if (!hideSettings?.userConfigured || hideSettings.hideLastN <= 0) return;
+    if (!hideSettings?.userConfigured || !hideSettings.hideLastN || hideSettings.hideLastN <= 0) return;
 
     while (chat.length > hideSettings.hideLastN) {
         chat.shift();

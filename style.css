@@ -37,6 +37,32 @@
     font-size: 16px;
 }
 
+/* --- 弹窗遮罩层 --- */
+.hide-helper-backdrop {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100vw;
+    height: 100vh;
+    background-color: rgba(0, 0, 0, 0.3);
+    backdrop-filter: blur(12px) saturate(180%);
+    -webkit-backdrop-filter: blur(12px) saturate(180%);
+    z-index: 1000;
+    display: none;
+    animation: backdropFadeIn 0.3s ease-out;
+    /* 确保 backdrop-filter 生效的关键属性 */
+    -webkit-transform: translateZ(0);
+    transform: translateZ(0);
+    will-change: backdrop-filter;
+}
+
+@keyframes backdropFadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
 /* --- 弹窗通用样式 --- */
 .hide-helper-popup, .hide-helper-instructions-popup {
     position: fixed;
@@ -89,17 +115,28 @@
     gap: 10px;
 }
 
-#hide-helper-popup .hide-helper-label {
-    font-weight: 500;
-    color: var(--text-secondary);
-    font-size: 14px;
-    margin: 0; /* 重置旧边距 */
+/* --- hide-last-n 专用区域样式 --- */
+#hide-helper-popup .hide-last-n-section {
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    background: var(--background-secondary);
+    padding: 12px 15px;
+    border-radius: 8px;
+    gap: 10px;
 }
 
-/* --- 输入框样式 --- */
-.hide-helper-popup #hide-last-n {
-    width: 100%;
-    padding: 10px 15px !important;
+#hide-helper-popup .hide-last-n-section .hide-helper-label {
+    flex: 1;
+    margin: 0;
+}
+
+/* --- hide-last-n 输入框样式 --- */
+.hide-helper-popup .hide-last-n-input {
+    min-width: 45px;
+    max-width: 45px;
+    padding: 8px 12px !important;
     border-radius: 8px !important;
     border: 1px solid var(--border-color) !important;
     background-color: var(--input-bg) !important;
@@ -107,10 +144,28 @@
     font-size: 16px !important;
     height: auto !important;
     box-sizing: border-box;
+    text-align: right;
     transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    /* 隐藏 Firefox 的数字输入框上下箭头 */
+    -moz-appearance: textfield !important;
 }
 
-.hide-helper-popup #hide-last-n:focus {
+/* 隐藏 Chrome, Safari, Edge, Opera 的数字输入框上下箭头 */
+.hide-helper-popup .hide-last-n-input::-webkit-outer-spin-button,
+.hide-helper-popup .hide-last-n-input::-webkit-inner-spin-button {
+    -webkit-appearance: none !important;
+    margin: 0 !important;
+}
+
+#hide-helper-popup .hide-helper-label {
+    font-weight: 500;
+    color: var(--text-secondary);
+    font-size: 14px;
+    margin: 0; /* 重置旧边距 */
+}
+
+/* --- 输入框焦点样式 --- */
+.hide-helper-popup .hide-last-n-input:focus {
     outline: none;
     border-color: var(--accent-color);
     box-shadow: 0 0 0 3px rgba(0, 123, 255, 0.3);
@@ -221,8 +276,6 @@ input:checked + .hide-helper-slider:before {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 10px;
-    margin-top: 10px;
-    border-top: 1px solid var(--border-color);
     padding-top: 20px;
 }
 
@@ -322,7 +375,7 @@ input:checked + .hide-helper-slider:before {
 .hide-helper-instructions-content h2 { font-size: 18px; margin-top: 25px; margin-bottom: 15px; color: var(--text-primary); border-left: 4px solid var(--accent-color); padding-left: 10px;}
 .hide-helper-instructions-content h2:first-child { margin-top: 0; }
 .hide-helper-instructions-content p { margin-bottom: 15px; color: var(--text-secondary); }
-.hide-helper-instructions-content strong { color: var(--accent-color); font-weight: 500; }
+.hide-helper-instructions-content strong { color: rgba(148, 0, 211, 0.75); font-weight: 500; }
 .hide-helper-instructions-content code { background-color: var(--background-secondary); padding: 3px 6px; border-radius: 4px; font-family: monospace; color: #c7254e;}
 .hide-helper-instructions-content ul { padding-left: 20px; }
 .hide-helper-instructions-content li { margin-bottom: 8px; color: var(--text-secondary); }
@@ -401,6 +454,88 @@ input:checked + .hide-helper-slider:before {
 
 #hide-helper-popup .popup-tabs-content .tab-panel.active {
     display: block !important;
+}
+
+/* --- 新增：popup-tabs-content 固定高度与滚动 --- */
+#hide-helper-popup .popup-tabs-content {
+    max-height: 360px;
+    overflow-y: auto;
+    padding-right: 8px;
+}
+
+/* 美化滚动条 */
+#hide-helper-popup .popup-tabs-content::-webkit-scrollbar {
+    width: 6px;
+}
+
+#hide-helper-popup .popup-tabs-content::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+#hide-helper-popup .popup-tabs-content::-webkit-scrollbar-thumb {
+    background-color: rgba(148, 0, 211, 0.3);
+    border-radius: 3px;
+}
+
+#hide-helper-popup .popup-tabs-content::-webkit-scrollbar-thumb:hover {
+    background-color: rgba(148, 0, 211, 0.6);
+}
+
+/* --- 隐藏楼层面板中的说明区域样式 --- */
+.hide-panel-instructions {
+    margin-top: 25px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border-color);
+}
+
+.hide-panel-instructions h3 {
+    font-size: 16px;
+    font-weight: 500;
+    color: var(--text-primary);
+    margin-bottom: 15px;
+    padding-left: 10px;
+    border-left: 4px solid var(--accent-color);
+}
+
+.hide-panel-instructions .instructions-content {
+    font-size: 13px;
+    line-height: 1.7;
+    color: var(--text-secondary);
+}
+
+/* 重要提示样式 */
+.hide-panel-instructions .important-note {
+    padding: 12px 15px;
+    margin-bottom: 20px;
+    border-radius: 8px;
+    background-color: rgba(148, 0, 211, 0.08);
+    border-left: 4px solid var(--accent-color);
+    color: var(--text-primary);
+    font-size: 14px;
+    line-height: 1.6;
+}
+
+.hide-panel-instructions .important-note strong {
+    color: var(--text-secondary);
+}
+
+.hide-panel-instructions p {
+    margin-bottom: 10px;
+}
+
+.hide-panel-instructions strong {
+    color: rgba(148, 0, 211, 0.75);
+    font-weight: 500;
+}
+
+.hide-panel-instructions ul,
+.hide-panel-instructions ol {
+    padding-left: 20px;
+    margin-bottom: 10px;
+}
+
+.hide-panel-instructions li {
+    margin-bottom: 5px;
 }
 
 /* --- 新增：限制器面板内的设置项样式 --- */
