@@ -26,7 +26,7 @@ const defaultSettings = {
     },
     // --- Limiter 设置 ---
     limiter_isEnabled: false,
-    limiter_migration_v2_complete: true,
+    limiter_migration_v2_complete: false,
 };
 
 // Limiter 双向同步防重入标志
