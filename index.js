@@ -15,6 +15,8 @@ const defaultSettings = {
     enabled: true,
     // 自动隐藏功能总开关
     autoHideEnabled: true,
+    // 记录是否首次查看隐藏楼层页面的使用说明
+    hide_instructions_viewed: false,
     // 用于存储每个实体设置的对象
     settings_by_entity: {},
     // 迁移标志
@@ -353,6 +355,7 @@ function createUI() {
                         </select>
                     </div>
                 </div>
+                <div style="font-size: 12px; color: var(--text-secondary); margin-top: 8px;">点击聊天输入框左侧菜单按钮中的隐藏助手按钮，即可打开插件面板</div>
                 <hr class="sysHR">
             </div>
         </div>
@@ -393,7 +396,7 @@ function createPopup() {
 
             <!-- 标签页导航 -->
             <div class="popup-tabs-nav">
-                <div class="tab-button active" data-tab="hide-panel">隐藏楼层</div>
+                <div class="tab-button veve" data-tab="hide-panel">隐藏楼层</div>
                 <div class="tab-button" data-tab="limiter-panel">限制楼层</div>
                 <div class="tab-button" data-tab="token-stats-panel">聊天统计</div>
                 <div class="tab-button" data-tab="instructions-panel">使用说明</div>
@@ -438,7 +441,7 @@ function createPopup() {
 
                     <!-- 功能说明区域 -->
                     <div class="hide-panel-instructions">
-                        <h3>功能说明</h3>
+                        <h3 id="hide-panel-instructions-title">使用说明</h3>
                         <div class="instructions-content">
                             <p class="important-note"><strong>启用该隐藏楼层功能后，酒馆将始终只发送最近N条楼层给AI，而N条目楼层之外的消息将会始终自动隐藏。</strong></p>
                             <p><strong>1. 前提说明</strong></p>
@@ -501,7 +504,7 @@ function createPopup() {
 
                 <!-- 面板3: 聊天统计 -->
                 <div id="token-stats-panel" class="tab-panel" data-tab="token-stats-panel">
-                    <div id="token-stats-content" class="tub-body tub-scrollable">
+                    <div id="token-stats-content" class="tub-body">
                         <div class="tub-row-1" id="tub-row-overview"></div>
                         <div class="tub-row-2" id="tub-row-wi-chart"></div>
                         <div id="tub-entries-section"></div>
@@ -1066,26 +1069,28 @@ function renderTokenStatsContent(totalTokens, chatTokens, wiTokens, otherTokens,
     if (books.length > 1) {
         filtersHtml = `
             <div class="tub-book-filters">
-                <button class="tub-book-btn active" data-book="all">All Books</button>
+                <button class="tub-book-btn active" data-book="all">所有条目</button>
                 ${books.map(b => `<button class="tub-book-btn" data-book="${b}">${b}</button>`).join('')}
             </div>
         `;
     }
 
     const sectionHtml = `
-        <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 10px;">
-            <div style="display: flex; align-items: center; gap: 8px;">
-                <div class="tub-section-title tub-title-text" style="margin-bottom:0;">已激活条目</div>
-                <div class="tub-search-wrapper">
-                    <svg class="tub-search-icon" id="tub-search-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-                    </svg>
-                    <input type="text" id="tub-search-input" class="tub-search-input" placeholder="搜索条目...">
+        <div id="tub-entries-header-sticky" style="position: sticky; top: -1px; background-color: var(--background-popup); z-index: 10; padding-top: 10px; padding-bottom: 5px; margin-left: -5px; padding-left: 5px">
+            <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 10px;">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <div class="tub-section-title tub-title-text" style="margin-bottom:0;">已激活条目</div>
+                    <div class="tub-search-wrapper">
+                        <svg class="tub-search-icon" id="tub-search-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                        </svg>
+                        <input type="text" id="tub-search-input" class="tub-search-input" placeholder="搜索条目...">
+                    </div>
                 </div>
+                <div id="tub-entries-total-display" style="font-size: 0.85em; font-weight: bold; color: #343a40 !important;"></div>
             </div>
-            <div id="tub-entries-total-display" style="font-size: 0.85em; font-weight: bold; color: #343a40 !important;"></div>
+            ${filtersHtml}
         </div>
-        ${filtersHtml}
         <div class="tub-row-3 tub-scrollable" id="tub-row-entries"></div>
     `;
     document.getElementById('tub-entries-section').innerHTML = sectionHtml;
@@ -1129,7 +1134,7 @@ function renderTokenStatsContent(totalTokens, chatTokens, wiTokens, otherTokens,
         });
 
         if (!combined.length) {
-            entriesContainer.innerHTML = '<div style="text-align:center;color:#868e96;padding:10px 0; direction: ltr !important;">No active entries found</div>';
+            entriesContainer.innerHTML = '<div style="text-align:center;color:#868e96;padding:10px 0; direction: ltr !important;">没有激活的条目</div>';
             return;
         }
 
@@ -1196,7 +1201,7 @@ function renderTokenStatsContent(totalTokens, chatTokens, wiTokens, otherTokens,
 // 渲染饼图
 function renderPieView(c, d, total) {
     const container = document.getElementById('tub-row-wi-chart');
-    if (!total) { container.innerHTML = '<div style="color:#868e96 !important;">No World Info Active</div>'; return; }
+    if (!total) { container.innerHTML = '<div style="color:#868e96 !important;">没有激活的世界书</div>'; return; }
 
     const cPct = (c / total) * 100;
     const dPct = (d / total) * 100;
@@ -1447,11 +1452,21 @@ function setupEventListeners() {
         Logger.debug('魔杖按钮被点击');
         if (!extension_settings[extensionName]?.enabled) {
             Logger.debug('插件已禁用');
-            toastr.warning('隐藏助手当前已禁用，请在扩展设置中启用。');
+            toastr.warning('隐藏助手当前已禁用，请打开酒馆顶部菜单栏的扩展程序页面将插件状态设置为开启。');
             return;
         }
         Logger.debug('插件已启用，更新显示后显示弹窗');
         updateCurrentHideSettingsDisplay();
+
+        // 首次打开时显示红色括号说明提示
+        const titleEl = $('#hide-panel-instructions-title');
+        if (!extension_settings[extensionName].hide_instructions_viewed) {
+            titleEl.html('使用说明<span style="color: red;">（向下滑查看完整内容）</span>');
+            extension_settings[extensionName].hide_instructions_viewed = true;
+            saveSettingsDebounced();
+        } else {
+            titleEl.text('使用说明');
+        }
 
         // ---- 【新增这一行，打开弹窗立刻执行统计】 ----
         updateTokenStatsUI();

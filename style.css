@@ -49,7 +49,7 @@
     background-color: rgba(0, 0, 0, 0.3);
     backdrop-filter: blur(12px) saturate(180%);
     -webkit-backdrop-filter: blur(12px) saturate(180%);
-    z-index: 1000;
+    z-index: 8888;
     display: none;
     animation: backdropFadeIn 0.3s ease-out;
     /* 确保 backdrop-filter 生效的关键属性 */
@@ -71,7 +71,7 @@
     background: var(--background-popup);
     border: 1px solid var(--border-color);
     border-radius: 12px;
-    z-index: 1001;
+    z-index: 9999;
     padding: 20px 25px;
     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1); /* 修改阴影 */
     display: none; /* JS控制显示 */
@@ -407,6 +407,7 @@ input:checked + .hide-helper-slider:before {
 /* --- 新增：弹窗标签页样式 (增加 ID 前缀防止污染和被污染) --- */
 #hide-helper-popup .popup-tabs-nav {
     display: flex !important;
+    justify-content: space-evenly !important; /* 增加分散对齐 */
     border-bottom: 1px solid var(--border-color) !important;
     /* 这里的负 margin 必须与父容器的 padding 精确匹配以确保贴边 */
     margin: -20px -25px 20px -25px !important;
@@ -420,9 +421,10 @@ input:checked + .hide-helper-slider:before {
     all: unset !important;
     box-sizing: border-box !important;
     display: block !important;
+    flex: 1 !important; /* 增加伸缩比例均分宽度 */
 
     /* 标签页具体样式 */
-    padding: 10px 20px !important;
+    padding: 10px 10px !important;
     cursor: pointer !important;
     background-color: transparent !important;
     color: var(--text-secondary) !important;
@@ -456,11 +458,10 @@ input:checked + .hide-helper-slider:before {
     display: block !important;
 }
 
-/* --- 新增：popup-tabs-content 固定高度与滚动 --- */
+/* --- popup-tabs-content 固定高度与滚动 --- */
 #hide-helper-popup .popup-tabs-content {
-    max-height: 360px;
+    max-height: 470px;
     overflow-y: auto;
-    padding-right: 8px;
 }
 
 /* 美化滚动条 */
@@ -575,7 +576,7 @@ input:checked + .hide-helper-slider:before {
 /* --- 调整：使用说明面板的内边距 --- */
 #hide-helper-instructions-content {
     padding: 0;
-    max-height: 40vh; /* 限制在弹窗内的高度 */
+    max-height: 465px !important; /* 统一设为最大高度465px */
 }
 
 /* --- 新增：自定义复选框样式，强制覆盖全局样式 --- */
@@ -713,10 +714,10 @@ input:checked + .hide-helper-slider:before {
 
 /* 统计面板容器 */
 #token-stats-panel .tub-body {
-    padding: 0 25px 0 0 !important; /* 修改：原本是0，改为在右侧留出 25px 空间 */
-    margin-right: -25px !important; /* 新增：利用负边距使滚动容器完全贴合到弹窗的最右侧内壁 */
-    overflow-x: hidden !important;
-    max-height: 50vh;
+    padding: 0 !important;
+    margin: 0 !important;
+    overflow: visible !important;
+    max-height: none !important; /* 移除高度限制，将主滚动权交给弹窗外部结构 */
 }
 
 #token-stats-panel .tub-title-text,
@@ -819,10 +820,11 @@ input:checked + .hide-helper-slider:before {
 
 /* 条目列表区域 */
 #token-stats-panel .tub-row-3 {
-    max-height: 250px !important;
-    padding-right: 25px !important; /* 修改：增加内边距来抵消外边距 */
-    margin-right: -25px !important; /* 新增：使内部的列表容器也延展到弹窗最右侧 */
+    max-height: 300px !important; /* 设置固定最大高度以开启内层列表的独立滚动 */
+    padding-right: 25px !important; /* 增加内边距给滚动条留出空间 */
+    margin-right: -25px !important; /* 使内部的列表容器延展到弹窗最右侧 */
     position: relative !important;
+    overscroll-behavior: contain !important; /* 核心：防止在列表内部滚动时穿透带动外层页面滑动 */
 }
 
 #token-stats-panel .tub-row-3 > * {
