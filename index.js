@@ -2,7 +2,7 @@
 import { extension_settings, loadExtensionSettings, getContext } from "../../../extensions.js";
 import Logger from "./Logger.js";
 // 尝试导入全局列表，路径可能需要调整！如果导入失败，迁移逻辑需要改用 API 调用
-import { saveSettingsDebounced, eventSource, event_types, getRequestHeaders, characters, scrollChatToBottom } from "../../../../script.js";
+import { saveSettings, saveSettingsDebounced, eventSource, event_types, getRequestHeaders, characters, scrollChatToBottom, Generate, stopGeneration, is_send_press } from "../../../../script.js";
 
 import { groups } from "../../../group-chats.js";
 import { power_user } from "../../../power-user.js";
@@ -31,6 +31,8 @@ const defaultSettings = {
     // --- Limiter 设置 ---
     limiter_isEnabled: false,
     limiter_migration_v2_complete: false,
+    // --- 标签页状态保存 ---
+    last_active_tab: 'hide-panel',
 };
 
 // Limiter 双向同步防重入标志
@@ -39,6 +41,27 @@ let _limiterSyncing = false;
 // 缓存上下文
 let cachedContext = null;
 
+// --- 模拟生成 (Dry Run) 机制变量 ---
+let isFakeGenerating = false;
+
+// 触发假发送以刷新 EJS 统计数据
+function forceRefreshTokenStats() {
+    // 如果已经在真正的生成中，或者正在假生成中，则跳过
+    if (isFakeGenerating || is_send_press) {
+        Logger.debug('当前正在生成中，跳过模拟刷新');
+        return;
+    }
+    isFakeGenerating = true;
+    Logger.debug('触发模拟生成 (Dry Run) 获取最新 EJS 统计...');
+    try {
+        // 调用底层的发送，逼迫酒馆计算所有动态上下文
+        Generate('normal');
+    } catch (e) {
+        isFakeGenerating = false;
+        Logger.error('模拟生成失败:', e);
+    }
+}
+
 // --- 聊天统计 (Token Stats) 数据存储 ---
 let calculatedWiTokens = 0;
 let wiDetailedStats = {};
@@ -46,30 +69,112 @@ let wiDetailedStats = {};
 // --- ST-PT 隐形拦截器 ---
 let stptInterceptedEntries = [];
 let isSTPTInterceptorSetup = false;
+let stptLastRunID = -1; // 记录 ST-PT 的运行周期 ID
 
 function setupSTPTInterceptor() {
     if (isSTPTInterceptorSetup) return;
 
-    // 采用安全拦截方案：监听 ST-PT 准备渲染上下文的事件
-    // 避开直接劫持 ejs.compile，防止 ST-PT 沙箱序列化函数时丢失作用域导致报错
     if (typeof eventSource !== 'undefined') {
         eventSource.on('prompt_template_prepare', (env) => {
-            // 当 ST-PT 准备渲染某个条目时，会将条目数据放入 env.world_info
-            if (env && env.world_info && env.world_info.comment) {
-                const val = env.world_info;
+            if (env && env.runType === 'generate') {
+                
+                // 周期管控：全新的生成回合重置拦截数组
+                if (env.runID !== undefined && env.runID !== stptLastRunID) {
+                    stptInterceptedEntries = [];
+                    stptLastRunID = env.runID;
+                }
 
-                // 记录拦截到的条目，用于后续 Token 统计校准
-                stptInterceptedEntries.push({
-                    world: val.world || 'ST-PT 注入',
-                    comment: val.comment || '未命名条目',
-                    rawText: val.content || '', // 原始模板内容
-                    isRaw: true
-                });
+                // 1. 顶层拦截 (如 @INJECT 等注入条目)
+                if (env.world_info && env.world_info.comment) {
+                    const val = env.world_info;
+                    stptInterceptedEntries.push({
+                        world: val.world || 'ST-PT 默认注入',
+                        comment: val.comment || '未命名条目',
+                        rawText: val.content || '',
+                        isRaw: true
+                    });
+                }
+
+                // 2. 动态劫持 (如 getwi)
+                const interceptFunction = (funcName) => {
+                    if (typeof env[funcName] === 'function' && !env[funcName]._isIntercepted) {
+                        const originalFunc = env[funcName];
+                        
+                        env[funcName] = async function(...args) {
+                            const result = await originalFunc.apply(this, args);
+
+                            if (result && typeof result === 'string' && result.trim() !== '') {
+                                let bookName = '';
+                                let keyword = '';
+
+                                // 步骤 A: 解析用户传给 getwi 的参数 (获取书名和检索词)
+                                if (args.length >= 2 && typeof args[1] !== 'object') {
+                                    // 应对 getwi(null, '柳飞絮') 或 getwi('书名', '柳飞絮')
+                                    bookName = args[0] || (env.world_info && env.world_info.world) || '';
+                                    keyword = String(args[1]);
+                                } else if (args.length > 0) {
+                                    // 应对 getwi('柳飞絮')
+                                    bookName = (env.world_info && env.world_info.world) || '';
+                                    keyword = String(args[0]);
+                                }
+
+                                // 兜底名字，防止反查失败
+                                let exactEntryName = `[动态检索] ${keyword}`;
+                                let finalBookName = bookName || '当前世界书';
+
+                                // 🌟🌟🌟 步骤 B: 核心修复 - 利用 ST-PT 原生接口反查真实的条目名字！
+                                // env.getWorldInfoData 是 ST-PT 暴露的获取世界书所有条目的方法
+                                if (typeof env.getWorldInfoData === 'function') {
+                                    try {
+                                        // 传入书名获取该书所有条目（如果不传则获取当前环境生效的条目）
+                                        const entries = await env.getWorldInfoData(bookName || undefined);
+                                        
+                                        if (Array.isArray(entries)) {
+                                            // 完美复刻 ST-PT 底层的查找逻辑：严格等于或正则匹配
+                                            const matchedEntry = entries.find(e => {
+                                                if (!e || !e.comment) return false;
+                                                if (e.comment === keyword || String(e.uid) === keyword) return true;
+                                                try {
+                                                    // 尝试用正则匹配 (ST-PT原生逻辑)
+                                                    if (e.comment.match && e.comment.match(keyword)) return true;
+                                                } catch(err) {}
+                                                return false;
+                                            });
+
+                                            // 如果找到了真实条目，提取出它的真名！
+                                            if (matchedEntry) {
+                                                exactEntryName = matchedEntry.comment;
+                                                if (matchedEntry.world) {
+                                                    finalBookName = matchedEntry.world;
+                                                }
+                                            }
+                                        }
+                                    } catch(e) {
+                                        // 忽略反查过程中的报错，安静地回落到兜底名字
+                                        console.warn("[隐藏助手] 反查真实世界书条目名失败，使用检索词替代:", e);
+                                    }
+                                }
+
+                                // 推入统计数组 (等待后续缝合)
+                                stptInterceptedEntries.push({
+                                    world: finalBookName,
+                                    comment: exactEntryName,
+                                    rawText: result,
+                                    isRaw: false
+                                });
+                            }
+                            return result;
+                        };
+                        env[funcName]._isIntercepted = true;
+                    }
+                };
+
+                interceptFunction('getwi');
+                interceptFunction('getWorldInfo');
             }
         });
-        Logger.success('成功挂载 ST-PT 渲染监听器 (安全拦截模式)');
+        Logger.success('成功挂载 ST-PT 渲染监听器 (已支持反查真实条目名)');
     }
-
     isSTPTInterceptorSetup = true;
 }
 
@@ -98,20 +203,28 @@ function centerPopup($popup) {
         return;
     }
 
+    // --- 改回 JS 实时计算居中 ---
+    // 解决移动端浏览器因视口高度变化导致的 CSS 居中定位失效问题
+    // 通过获取实际窗口宽高并减去弹窗实际宽高，算出绝对安全的像素坐标
+
     const windowWidth = $(window).width();
     const windowHeight = $(window).height();
     const popupWidth = $popup.outerWidth();
     const popupHeight = $popup.outerHeight();
 
-    // 计算 top 和 left，确保弹窗不会完全贴边
-    const top = Math.max(10, (windowHeight - popupHeight) / 2);
-    const left = Math.max(10, (windowWidth - popupWidth) / 2);
+    // 动态计算居中坐标
+    let top = (windowHeight - popupHeight) / 2;
+    let left = (windowWidth - popupWidth) / 2;
+
+    // 安全边界防溢出（留出至少 10px 的边距，防止极小屏幕下跑偏到屏幕外）
+    top = Math.max(10, top);
+    left = Math.max(10, left);
 
     $popup.css({
-        top: `${top}px`,
-        left: `${left}px`,
-        // 确保移除旧的 transform 定位，防止冲突
-        transform: 'none'
+        top: top + 'px',
+        left: left + 'px',
+        transform: 'none', // 清除可能存在的 CSS 缩放和平移干扰
+        margin: '0'
     });
 }
 
@@ -415,71 +528,77 @@ function createPopup() {
                         </div>
                     </div>
 
-                    <div class="hide-helper-section hide-last-n-section">
-                        <label class="hide-helper-label">保留最新的N条消息，并隐藏其余旧楼层</label>
-                        <input type="number" id="hide-last-n" min="0" placeholder="" class="hide-last-n-input">
+                    <div class="limiter-setting-item" id="hide-disabled-msg" style="display: none; justify-content: center; color: var(--text-secondary);">
+                        当前隐藏楼层功能已禁用
                     </div>
-                    <div class="hide-helper-current">
-                        <strong id="hide-status-text">当前保留楼层数:</strong>
-                        <span id="hide-current-value">无</span>
-                    </div>
-                    <div class="hide-helper-mode-switch">
-                        <div class="label-group">
-                            <span id="hide-mode-label">全局模式</span>
-                            <span id="hide-mode-description">设置将应用于所有聊天</span>
+
+                    <div id="hide-settings-wrapper">
+                        <div class="hide-helper-section hide-last-n-section">
+                            <label class="hide-helper-label">保留最新的N条消息，并隐藏其余旧楼层</label>
+                            <input type="number" id="hide-last-n" min="0" placeholder="" class="hide-last-n-input">
                         </div>
-                        <label class="hide-helper-switch">
-                            <input type="checkbox" id="hide-mode-toggle">
-                            <span class="hide-helper-slider"></span>
-                        </label>
-                    </div>
-                    <div class="hide-helper-popup-footer" style="display: flex; justify-content: center;">
-                        <button id="hide-unhide-all-btn" class="hide-helper-btn">
-                            <i class="fa-solid fa-eye-slash"></i> 立即将当前聊天所有楼层取消隐藏
-                        </button>
-                    </div>
+                        <div class="hide-helper-current">
+                            <strong id="hide-status-text">当前保留楼层数:</strong>
+                            <span id="hide-current-value">无</span>
+                        </div>
+                        <div class="hide-helper-mode-switch">
+                            <div class="label-group">
+                                <span id="hide-mode-label">全局模式</span>
+                                <span id="hide-mode-description">设置将应用于所有聊天</span>
+                            </div>
+                            <label class="hide-helper-switch">
+                                <input type="checkbox" id="hide-mode-toggle">
+                                <span class="hide-helper-slider"></span>
+                            </label>
+                        </div>
+                        <div class="hide-helper-popup-footer" style="display: flex; justify-content: center;">
+                            <button id="hide-unhide-all-btn" class="hide-helper-btn">
+                                <i class="fa-solid fa-eye-slash"></i> 立即将当前聊天所有楼层取消隐藏
+                            </button>
+                        </div>
 
-                    <!-- 功能说明区域 -->
-                    <div class="hide-panel-instructions">
-                        <h3 id="hide-panel-instructions-title">使用说明</h3>
-                        <div class="instructions-content">
-                            <p class="important-note"><strong>启用该隐藏楼层功能后，酒馆将始终只发送最近N条楼层给AI，而N条目楼层之外的消息将会始终自动隐藏。</strong></p>
-                            <p><strong>1. 前提说明</strong></p>
-                            <p>在使用"自动隐藏"功能前，请务必确认以下配置：</p>
-                            <ul>
-                                <li><strong>必要操作</strong>：必须勾选 <strong>【启用隐藏楼层功能】</strong> 并设置 <strong>【保留的楼层数 N】</strong>，否则功能不会生效。</li>
-                                <li><strong>功能独立性</strong>：插件包含【隐藏楼层】、【限制楼层】和【聊天统计】三个核心功能。它们之间相互独立，互不影响。</li>
-                                <li>若只想使用【限制楼层】和【聊天统计】，只需<strong>不勾选</strong>【启用隐藏楼层功能】即可。</li>
-                            </ul>
+                        <!-- 功能说明区域 -->
+                        <div class="hide-panel-instructions">
+                            <h3 id="hide-panel-instructions-title">使用说明</h3>
+                            <div class="instructions-content">
+                                <p class="important-note"><strong>启用该隐藏楼层功能后，酒馆将始终只发送最近N条楼层给AI，而N条目楼层之外的消息将会始终自动隐藏。</strong></p>
+                                <p><strong>1. 前提说明</strong></p>
+                                <p>在使用"自动隐藏"功能前，请务必确认以下配置：</p>
+                                <ul>
+                                    <li><strong>必要操作</strong>：必须勾选 <strong>【启用隐藏楼层功能】</strong> 并设置 <strong>【保留的楼层数 N】</strong>，否则功能不会生效。</li>
+                                    <li><strong>功能独立性</strong>：插件包含【隐藏楼层】、【限制楼层】和【聊天统计】三个核心功能。它们之间相互独立，互不影响。</li>
+                                    <li>若只想使用【限制楼层】和【聊天统计】，只需<strong>不勾选</strong>【启用隐藏楼层功能】即可。</li>
+                                </ul>
 
-                            <p><strong>2. 使用说明</strong></p>
-                            <p>设置保留楼层数 <strong>N</strong> 并启用功能后，插件会始终自动隐藏最近 N 楼之外的所有消息。</p>
-                            <ul>
-                                <li><strong>示例</strong>：设置保留最近 <strong>1</strong> 楼。</li>
-                                <li><strong>效果</strong>：若当前共有第 0 楼至第 9 楼消息，插件将自动隐藏第 0 至第 8 楼，仅将最新的第 9 楼消息发送给 AI。</li>
-                            </ul>
+                                <p><strong>2. 使用说明</strong></p>
+                                <p>设置保留楼层数 <strong>N</strong> 并启用功能后，插件会始终自动隐藏最近 N 楼之外的所有消息。</p>
+                                <ul>
+                                    <li><strong>示例</strong>：设置保留最近 <strong>1</strong> 楼。</li>
+                                    <li><strong>效果</strong>：若当前共有第 0 楼至第 9 楼消息，插件将自动隐藏第 0 至第 8 楼，仅将最新的第 9 楼消息发送给 AI。</li>
+                                </ul>
 
-                            <p><strong>3. 立即将当前聊天所有楼层取消隐藏</strong></p>
-                            <p>点击此按钮将执行以下操作：</p>
-                            <ol>
-                                <li>立即取消当前聊天中所有楼层的隐藏状态。</li>
-                                <li>清空【保留的楼层数 N】的数值。</li>
-                                <li><strong>结果</strong>：自动隐藏功能将处于不生效状态。</li>
-                            </ol>
+                                <p><strong>3. 立即将当前聊天所有楼层取消隐藏</strong></p>
+                                <p>点击此按钮将执行以下操作：</p>
+                                <ol>
+                                    <li>立即取消当前聊天中所有楼层的隐藏状态。</li>
+                                    <li>清空【保留的楼层数 N】的数值。</li>
+                                    <li><strong>结果</strong>：自动隐藏功能将处于不生效状态。</li>
+                                </ol>
 
-                            <p><strong>4. 模式选择</strong></p>
-                            <p>插件提供两种配置模式，建议根据使用习惯选择：</p>
-                            <ul>
-                                <li><strong>全局模式（推荐）</strong>：只需设置一次【保留的楼层数】。该数值将应用于所有角色，切换角色无需重新配置，简单方便。</li>
-                                <li><strong>角色模式</strong>：需要为每个角色卡单独设置【保留的楼层数】。注意：若某个角色未设置数值（数值为空），则该角色的自动隐藏功能不会生效。</li>
-                            </ul>
+                                <p><strong>4. 模式选择</strong></p>
+                                <p>插件提供两种配置模式，建议根据使用习惯选择：</p>
+                                <ul>
+                                    <li><strong>全局模式（推荐）</strong>：只需设置一次【保留的楼层数】。该数值将应用于所有角色，切换角色无需重新配置，简单方便。</li>
+                                    <li><strong>角色模式</strong>：需要为每个角色卡单独设置【保留的楼层数】。注意：若某个角色未设置数值（数值为空），则该角色的自动隐藏功能不会生效。</li>
+                                </ul>
 
-                            <p><strong>5. 注意事项与兼容性</strong></p>
-                            <ul>
-                                <li><strong>正则冲突</strong>：该功能与"隐藏楼层正则"冲突，请确保仅开启其中一个。</li>
-                                <li><strong>插件冲突</strong>：若其他插件/脚本也具备自动隐藏功能，请仅启用其中一个，避免运行逻辑打架。</li>
-                                <li><strong>核心原理</strong>：在没有其他脚本干预的情况下，本插件能确保仅发送最近 N 条消息。除了执行隐藏操作外，插件还会从底层<strong>直接截断发送的上下文</strong>，从根本上保证发送的消息层数符合设定。</li>
-                            </ul>
+                                <p><strong>5. 注意事项与兼容性</strong></p>
+                                <ul>
+                                    <li><strong>正则冲突</strong>：该功能与"隐藏楼层正则"冲突，请确保仅开启其中一个。</li>
+                                    <li><strong>插件冲突</strong>：若其他插件/脚本也具备自动隐藏功能，请仅启用其中一个，避免运行逻辑打架。</li>
+                                    <li><strong>核心原理</strong>：在没有其他脚本干预的情况下，本插件能确保仅发送最近 N 条消息。除了执行隐藏操作外，插件还会从底层<strong>直接截断发送的上下文</strong>，从根本上保证发送的消息层数符合设定。</li>
+                                </ul>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -493,12 +612,15 @@ function createPopup() {
                             <label for="limiter-enabled"></label>
                         </div>
                     </div>
-                    <div class="limiter-setting-item">
+                    <div class="limiter-setting-item" id="limiter-count-wrapper">
                         <label for="limiter-count">加载的消息楼层数量</label>
-                        <input id="limiter-count" type="number" class="text_pole" min="0" max="1000" step="5" placeholder="例如: 20">
+                        <input id="limiter-count" type="number" class="text_pole" min="0" max="1000" step="1" placeholder="例如: 20">
+                    </div>
+                    <div class="limiter-setting-item" id="limiter-disabled-msg" style="display: none; justify-content: center; color: var(--text-secondary);">
+                        当前限制楼层功能已禁用
                     </div>
                     <div class="limiter-description">
-                        该功能会实时动态限制聊天界面加载的消息楼层数量，以减少酒馆卡顿，提高流畅度。建议设置的【加载的消息楼层数量】不要超过20。没有加载（且也未被隐藏）的楼层消息依然会被当做上下文发送给AI。该功能实际上和酒馆原生的【要渲染 # 条消息】是同一个接口，因此和酒馆或酒馆助手以及鸡尾酒插件的“限制消息加载”功能不会冲突。
+                        该功能会实时动态限制聊天界面加载的消息楼层数量，以减少酒馆卡顿，提高流畅度。建议设置的【加载的消息楼层数量】不要超过20。没有加载（且也未被隐藏）的楼层消息依然会被当做上下文发送给AI。该功能实际上和酒馆原生的【要渲染 # 条消息】是同一个接口，因此和酒馆或酒馆助手以及鸡尾酒插件的"限制消息加载"功能不会冲突。
                     </div>
                 </div>
 
@@ -592,7 +714,7 @@ function getCurrentHideSettings() {
     }
     let settings = extension_settings[extensionName]?.settings_by_entity?.[entityId];
     if (!settings) {
-        Logger.debug(`未找到实体 "${entityId}" 的设置，使用角色模式默认值 (hideLastN: 6)`);
+        // 强制赋予初始默认值
         settings = { hideLastN: 6, lastProcessedLength: 0, userConfigured: true };
     }
     Logger.debug(`读取实体 "${entityId}" 的设置:`, settings);
@@ -656,10 +778,20 @@ function updateCurrentHideSettingsDisplay() {
     const $input = $('#hide-last-n');
 
     // 更新功能总开关状态
-    $('#hide-auto-process-toggle').prop('checked', settings.autoHideEnabled ?? true);
+    const autoHideEnabled = settings.autoHideEnabled ?? true;
+    $('#hide-auto-process-toggle').prop('checked', autoHideEnabled);
+
+    // 根据开关状态切换输入框和提示文本的显示
+    if (autoHideEnabled) {
+        $('#hide-settings-wrapper').show();
+        $('#hide-disabled-msg').hide();
+    } else {
+        $('#hide-settings-wrapper').hide();
+        $('#hide-disabled-msg').show();
+    }
 
     // 逻辑判定文案
-    if (!(settings.autoHideEnabled ?? true)) {
+    if (!autoHideEnabled) {
         $statusText.text("自动隐藏楼层功能已禁用");
         $valueDisplay.text("");
     } else if (!currentHideSettings?.hideLastN || currentHideSettings.hideLastN <= 0) {
@@ -679,16 +811,27 @@ function updateCurrentHideSettingsDisplay() {
     $('#hide-mode-label').text(useGlobal ? '全局模式' : '角色模式');
     $('#hide-mode-description').text(useGlobal ? '隐藏将应用于所有角色卡' : '隐藏仅对当前角色卡生效');
 
-    // --- 更新 Limiter 面板 ---
-    // 【修复】：优先从 DOM 读取原生设置值，确保读取的是最新最准确的值
-    let nativeTruncation = Number($('#chat_truncation').val());
-    if (isNaN(nativeTruncation) || nativeTruncation <= 0) {
-        nativeTruncation = power_user.chat_truncation || 0;
+	// --- 更新 Limiter 面板 ---
+    // 优先从底层内存变量 power_user 读取，避免网页刷新时被原生 DOM 的 step="5" 属性强行四舍五入污染数值
+    let nativeTruncation = power_user.chat_truncation;
+    if (typeof nativeTruncation !== 'number' || isNaN(nativeTruncation) || nativeTruncation <= 0) {
+        // 如果底层没有有效数据，再尝试从 DOM 读取作为兜底
+        nativeTruncation = Number($('#chat_truncation').val()) || 0;
     }
 
-    $('#limiter-enabled').prop('checked', extension_settings[extensionName].limiter_isEnabled);
+    const isLimiterEnabled = extension_settings[extensionName].limiter_isEnabled;
+    $('#limiter-enabled').prop('checked', isLimiterEnabled);
     // 有效值则显示，为 0 时设为空字符串，使其平滑回落到 placeholder 的提示
     $('#limiter-count').val(nativeTruncation > 0 ? nativeTruncation : '');
+
+    // 根据开关状态切换输入框和提示文本的显示
+    if (isLimiterEnabled) {
+        $('#limiter-count-wrapper').show();
+        $('#limiter-disabled-msg').hide();
+    } else {
+        $('#limiter-count-wrapper').hide();
+        $('#limiter-disabled-msg').show();
+    }
 
     Logger.debug('完成更新隐藏设置显示');
 }
@@ -813,10 +956,10 @@ async function runIncrementalHideCheck() {
         if (toHideIncrementally.length > 0) {
             Logger.info(`增量隐藏消息: 索引 [${toHideIncrementally.join(', ')}]`);
             Logger.debug('更新聊天数组数据...');
-            toHideIncrementally.forEach(idx => {
+            toHideIncrementally.forEach(idx => { 
                 if (chat[idx]) {
-                    chat[idx].is_system = true;
-                    chat[idx].hide_helper_hidden = true;
+                    chat[idx].is_system = true; 
+                    chat[idx].hide_helper_hidden = true; // <-- 独家自定义标记
                 }
             });
             Logger.debug('聊天数组数据已更新');
@@ -905,15 +1048,20 @@ async function runFullHideCheck() {
         if (shouldBeHidden && !isCurrentlyHidden) {
             Logger.debug(`索引 ${i} 应隐藏但未隐藏，标记为隐藏`);
             msg.is_system = true;
-            msg.hide_helper_hidden = true;
+            msg.hide_helper_hidden = true; // <-- 独家自定义标记
             toHide.push(i);
             changed = true;
-        } else if (!shouldBeHidden && isCurrentlyHidden && msg.hide_helper_hidden === true) {
+        } else if (!shouldBeHidden && isCurrentlyHidden) {
             Logger.debug(`索引 ${i} 应显示但已隐藏，标记为显示`);
-            msg.is_system = false;
-            delete msg.hide_helper_hidden;
-            toShow.push(i);
-            changed = true;
+            // 必须增加对 hide_helper_hidden === true 的联合判定
+            if (msg.hide_helper_hidden === true) {
+                msg.is_system = false;
+                delete msg.hide_helper_hidden; // <-- 恢复后需清理标记
+                toShow.push(i);
+                changed = true;
+            } else {
+                Logger.debug(`索引 ${i} 并非本插件隐藏，跳过恢复`);
+            }
         }
     }
     Logger.debug(`差异计算完成。需要更改: ${changed}。隐藏: ${toHide.length}, 显示: ${toShow.length}`);
@@ -961,32 +1109,14 @@ async function unhideAllMessages(isFromInputZero = false) {
 
     if (context?.chat) {
         const chat = context.chat;
-        const chatLength = chat.length;
-        const toShow = [];
-
-        for (let i = 0; i < chatLength; i++) {
-            if (chat[i] && chat[i].is_system === true && chat[i].hide_helper_hidden === true) {
-                toShow.push(i);
-            }
-        }
-
-        if (toShow.length > 0) {
-            toShow.forEach(idx => {
-                if (chat[idx]) {
-                    chat[idx].is_system = false;
-                    delete chat[idx].hide_helper_hidden;
-                }
-            });
-            try {
-                const showSelector = toShow.map(id => `.mes[mesid="${id}"]`).join(',');
-                if (showSelector) {
-                     $(showSelector).attr('is_system', 'false');
-                }
-            } catch (error) {
-                Logger.error('取消隐藏时更新 DOM 发生错误:', error);
-            }
-        }
-        Logger.debug('已取消所有插件系统标记');
+        chat.forEach((msg, idx) => { 
+            if (msg.is_system === true && msg.hide_helper_hidden === true) { 
+                msg.is_system = false; 
+                delete msg.hide_helper_hidden;
+                $(`.mes[mesid="${idx}"]`).attr('is_system', 'false');
+            } 
+        });
+        Logger.debug('已取消所有消息的系统标记');
     }
 
     // 将设置设为空/禁用状态
@@ -1055,13 +1185,14 @@ function renderTokenStatsContent(totalTokens, chatTokens, wiTokens, otherTokens,
         <div class="tub-stat-box"><span class="tub-stat-label">其他</span><span class="tub-stat-value">${otherTokens}<br><small>${getPct(otherTokens)}%</small></span></div>
     `;
 
-    // 计算常量和动态世界书 tokens
-    let totalC = 0, totalD = 0;
+    // 计算常量、动态和EJS世界书 tokens
+    let totalC = 0, totalD = 0, totalE = 0;
     for (const b in statsObj) {
-        statsObj[b].constant.forEach(e => totalC += e.tokens);
-        statsObj[b].dynamic.forEach(e => totalD += e.tokens);
+        if (statsObj[b].constant) statsObj[b].constant.forEach(e => totalC += e.tokens);
+        if (statsObj[b].dynamic) statsObj[b].dynamic.forEach(e => totalD += e.tokens);
+        if (statsObj[b].ejs) statsObj[b].ejs.forEach(e => totalE += e.tokens);
     }
-    renderPieView(totalC, totalD, totalC + totalD);
+    renderPieView(totalC, totalD, totalE, totalC + totalD + totalE);
 
     // 渲染条目列表
     const books = Object.keys(statsObj);
@@ -1107,29 +1238,47 @@ function renderTokenStatsContent(totalTokens, chatTokens, wiTokens, otherTokens,
         let combined = [];
         let filterTotalC = 0;
         let filterTotalD = 0;
+        let filterTotalE = 0;
 
         for (const b in statsObj) {
             if (currentBookFilter !== 'all' && b !== currentBookFilter) continue;
 
+            // 过滤并压入 ejs
+            if (statsObj[b].ejs) {
+                statsObj[b].ejs.forEach(e => {
+                    if (currentSearchTerm && !e.name.toLowerCase().includes(currentSearchTerm)) return;
+                    combined.push({ ...e, b, type: 'ejs' });
+                    filterTotalE += e.tokens;
+                });
+            }
             // 过滤并压入 dynamic
-            statsObj[b].dynamic.forEach(e => {
-                if (currentSearchTerm && !e.name.toLowerCase().includes(currentSearchTerm)) return;
-                combined.push({ ...e, b, type: 'dynamic' });
-                filterTotalD += e.tokens;
-            });
+            if (statsObj[b].dynamic) {
+                statsObj[b].dynamic.forEach(e => {
+                    if (currentSearchTerm && !e.name.toLowerCase().includes(currentSearchTerm)) return;
+                    combined.push({ ...e, b, type: 'dynamic' });
+                    filterTotalD += e.tokens;
+                });
+            }
             // 过滤并压入 constant
-            statsObj[b].constant.forEach(e => {
-                if (currentSearchTerm && !e.name.toLowerCase().includes(currentSearchTerm)) return;
-                combined.push({ ...e, b, type: 'constant' });
-                filterTotalC += e.tokens;
-            });
+            if (statsObj[b].constant) {
+                statsObj[b].constant.forEach(e => {
+                    if (currentSearchTerm && !e.name.toLowerCase().includes(currentSearchTerm)) return;
+                    combined.push({ ...e, b, type: 'constant' });
+                    filterTotalC += e.tokens;
+                });
+            }
         }
 
-        const filterTotal = filterTotalC + filterTotalD;
-        totalDisplay.innerHTML = `${filterTotal}t (<span style="color:#22c55e !important;">${filterTotalD}t</span> + <span style="color:#3b82f6 !important;">${filterTotalC}t</span>)`;
+        const filterTotal = filterTotalC + filterTotalD + filterTotalE;
+        // 构建顶部总数显示，如果有 EJS 则显示红色部分
+        let totalHtml = `${filterTotal} (`;
+        if (filterTotalE > 0) totalHtml += `<span style="color:#ef4444 !important;">${filterTotalE}</span> + `;
+        totalHtml += `<span style="color:#22c55e !important;">${filterTotalD}</span> + <span style="color:#3b82f6 !important;">${filterTotalC}</span>)`;
+        totalDisplay.innerHTML = totalHtml;
 
         combined.sort((a, b) => {
-            if (a.type !== b.type) return a.type === 'dynamic' ? -1 : 1;
+            const order = { 'ejs': 1, 'dynamic': 2, 'constant': 3 };
+            if (a.type !== b.type) return order[a.type] - order[b.type];
             return b.tokens - a.tokens;
         });
 
@@ -1145,7 +1294,10 @@ function renderTokenStatsContent(totalTokens, chatTokens, wiTokens, otherTokens,
             const bookTag = (currentBookFilter === 'all' && books.length > 1) ? ` <span style="color:#868e96;font-size:0.85em;font-weight:normal;">(${e.b})</span>` : '';
 
             let gradientBg = '';
-            if (e.type === 'constant') {
+            if (e.type === 'ejs') {
+                // EJS 专属浅红背景色
+                gradientBg = `background: linear-gradient(to right, #fee2e2 ${pct}%, #f8fafc ${pct}%);`;
+            } else if (e.type === 'constant') {
                 gradientBg = `background: linear-gradient(to right, #dbeafe ${pct}%, #f8fafc ${pct}%);`;
             } else {
                 gradientBg = `background: linear-gradient(to right, #dcfce7 ${pct}%, #f8fafc ${pct}%);`;
@@ -1158,8 +1310,7 @@ function renderTokenStatsContent(totalTokens, chatTokens, wiTokens, otherTokens,
                 </div>`);
         });
 
-        // 初始化滚动条逻辑
-        initScrollbarLogic();
+        // 滚动条逻辑已移除
     };
 
     renderEntriesList();
@@ -1198,13 +1349,14 @@ function renderTokenStatsContent(totalTokens, chatTokens, wiTokens, otherTokens,
     }, 300));
 }
 
-// 渲染饼图
-function renderPieView(c, d, total) {
+// 渲染饼图 (增加 EJS 红色切片)
+function renderPieView(c, d, e, total) {
     const container = document.getElementById('tub-row-wi-chart');
     if (!total) { container.innerHTML = '<div style="color:#868e96 !important;">没有激活的世界书</div>'; return; }
 
     const cPct = (c / total) * 100;
     const dPct = (d / total) * 100;
+    const ePct = (e / total) * 100;
 
     const cAngle = (cPct / 2) * 3.6;
     const cRad = (cAngle - 90) * (Math.PI / 180);
@@ -1216,41 +1368,28 @@ function renderPieView(c, d, total) {
     const dX = 50 + 30 * Math.cos(dRad);
     const dY = 50 + 30 * Math.sin(dRad);
 
+    // 计算 EJS 切片文字位置
+    const eAngle = (cPct + dPct + ePct / 2) * 3.6;
+    const eRad = (eAngle - 90) * (Math.PI / 180);
+    const eX = 50 + 30 * Math.cos(eRad);
+    const eY = 50 + 30 * Math.sin(eRad);
+
     container.innerHTML = `
-        <div class="tub-pie-chart" style="background: conic-gradient(#3b82f6 0% ${cPct}%, #22c55e ${cPct}% 100%);">
+        <div class="tub-pie-chart" style="background: conic-gradient(#3b82f6 0% ${cPct}%, #22c55e ${cPct}% ${cPct + dPct}%, #ef4444 ${cPct + dPct}% 100%);">
             ${cPct >= 5 ? `<span class="tub-pie-text" style="left: ${cX}px; top: ${cY}px;">${cPct.toFixed(0)}%</span>` : ''}
             ${dPct >= 5 ? `<span class="tub-pie-text" style="left: ${dX}px; top: ${dY}px;">${dPct.toFixed(0)}%</span>` : ''}
+            ${ePct >= 5 ? `<span class="tub-pie-text" style="left: ${eX}px; top: ${eY}px;">${ePct.toFixed(0)}%</span>` : ''}
         </div>
         <div class="tub-legend">
-            <div style="display:flex; align-items:center;"><span class="tub-dot tub-dot-blue"></span>蓝灯: ${c}</div>
+            ${e > 0 ? `<div style="display:flex; align-items:center;"><span class="tub-dot tub-dot-red"></span>EJS: ${e}</div>` : ''}
             <div style="display:flex; align-items:center;"><span class="tub-dot tub-dot-green"></span>绿灯: ${d}</div>
+            <div style="display:flex; align-items:center;"><span class="tub-dot tub-dot-blue"></span>蓝灯: ${c}</div>
         </div>
     `;
 }
 
-// 滚动条自动隐藏/显示逻辑
+// 滚动条自动隐藏/显示逻辑 (已移除)
 function initScrollbarLogic() {
-    const scrollables = document.querySelectorAll('#token-stats-panel .tub-scrollable');
-    scrollables.forEach(el => {
-        if (el.dataset.scrollInit) return;
-        el.dataset.scrollInit = "true";
-
-        let scrollTimeout;
-        const hideScrollbar = () => el.classList.remove('is-scrolling');
-
-        el.addEventListener('scroll', () => {
-            el.classList.add('is-scrolling');
-            clearTimeout(scrollTimeout);
-            scrollTimeout = setTimeout(() => {
-                if (!el.matches(':hover')) hideScrollbar();
-            }, 2000);
-        });
-
-        el.addEventListener('mouseleave', () => {
-            clearTimeout(scrollTimeout);
-            scrollTimeout = setTimeout(hideScrollbar, 2000);
-        });
-    });
 }
 
 // ==================== 聊天统计功能结束 ====================
@@ -1278,7 +1417,7 @@ function setupEventListeners() {
             const type = entry.constant ? "constant" : "dynamic";
 
             if (!wiDetailedStats[bookName]) {
-                wiDetailedStats[bookName] = { constant: [], dynamic: [], total: 0 };
+                wiDetailedStats[bookName] = { constant: [], dynamic: [], ejs: [], total: 0 };
             }
             wiDetailedStats[bookName][type].push({ name: entryName, tokens: tokens });
             wiDetailedStats[bookName].total += tokens;
@@ -1293,160 +1432,88 @@ function setupEventListeners() {
         });
     }
 
-    // 每次生成开始前，清空拦截记录
+    // 在外部声明一个合并状态锁，防止单次回合被重复合并
+    let stptMergedThisTurn = false;
+
+    // 每次生成开始时重置锁
     eventSource.on(event_types.GENERATION_STARTED, () => {
-        stptInterceptedEntries = [];
+        stptMergedThisTurn = false;
     });
 
-    // 监听最终准备发送的数据，进行终极统计计算
-    eventSource.on(event_types.CHAT_COMPLETION_SETTINGS_READY, async (completion) => {
+    // 监听生成就绪事件，进行数据缝合
+    eventSource.on(event_types.CHAT_COMPLETION_SETTINGS_READY, (completion) => {
+        // 🌟【核心机制】：如果是我们自己触发的假发送，立刻终止请求，不让它发给AI！
+        if (isFakeGenerating) {
+            stopGeneration();
+            isFakeGenerating = false;
+            Logger.debug('模拟生成已拦截，成功获取最新数据');
+        }
+
         if (!completion || !completion.messages) return;
 
-        let absoluteTotalTokens = 0;
+        setTimeout(async () => {
+            try {
+                if (stptMergedThisTurn) return; // 防重复执行
+                stptMergedThisTurn = true;
 
-        // 1. 像 PromptViewer 一样计算发给 AI 的绝对精确总 Tokens
-        await Promise.all(completion.messages.map(async (msg) => {
-            if (typeof msg.content === 'string') {
-                absoluteTotalTokens += await getTokenCountAsync(msg.content);
-            } else if (Array.isArray(msg.content)) {
-                for (const item of msg.content) {
-                    if (item.type === 'text' && item.text) {
-                        absoluteTotalTokens += await getTokenCountAsync(item.text);
-                    }
+                // 去重
+                const processedSTPT = new Map();
+                for (const entry of stptInterceptedEntries) {
+                    const key = `${entry.world}::${entry.comment}`;
+                    if (!processedSTPT.has(key)) processedSTPT.set(key, entry);
                 }
-            }
-        }));
 
-        // 2. 处理刚才拦截到的 ST-PT 条目 (去重)
-        const processedSTPT = new Map();
-        for (const entry of stptInterceptedEntries) {
-            // 使用世界书名和条目备注作为唯一键进行去重
-            const key = `${entry.world}::${entry.comment}`;
-            if (!processedSTPT.has(key)) {
-                processedSTPT.set(key, entry);
-            }
-        }
-
-        let stptTokensCount = 0;
-        const stptStats = [];
-
-        // 计算拦截条目的 Tokens
-        for (const entry of processedSTPT.values()) {
-            const textToMeasure = entry.rawText || '';
-            if (textToMeasure.trim() === '') continue;
-
-            const tk = await getTokenCountAsync(textToMeasure);
-            stptTokensCount += tk;
-            stptStats.push({
-                bookName: entry.world,
-                entryName: `[EJS] ${entry.comment}`,
-                tokens: tk
-            });
-        }
-
-        // 深拷贝酒馆原生的统计数据，防止因为重试生成导致数据叠加污染
-        const combinedWiStats = JSON.parse(JSON.stringify(wiDetailedStats));
-
-        // 把拦截到的 ST-PT 隐形条目，完美缝合进世界书统计面板
-        stptStats.forEach(stat => {
-            if (!combinedWiStats[stat.bookName]) {
-                combinedWiStats[stat.bookName] = { constant: [], dynamic: [], total: 0 };
-            }
-            combinedWiStats[stat.bookName].dynamic.push({
-                name: stat.entryName,
-                tokens: stat.tokens
-            });
-            combinedWiStats[stat.bookName].total += stat.tokens;
-        });
-
-        const wiTokens = calculatedWiTokens + stptTokensCount;
-
-        // 3. 计算原生聊天 Tokens
-        let chatTokens = 0;
-        const pm = promptManager;
-        if (pm && pm.messages) {
-            const findCollectionById = (c, id) => {
-                if (c.identifier === id) return c;
-                if (c.collection) {
-                    for (const i of c.collection) {
-                        if (i instanceof Object && i.collection) {
-                            const f = findCollectionById(i, id);
-                            if (f) return f;
-                        }
-                    }
+                if (processedSTPT.size > 0) {
+                    console.log(`[隐藏助手] 准备缝合 ST-PT 动态加载条目:`, Array.from(processedSTPT.keys()));
                 }
-                return null;
-            };
-            const chatHistory = findCollectionById(pm.messages, 'chatHistory');
-            if (chatHistory) {
-                chatHistory.getCollection().forEach(msg => {
-                    if (msg.role === 'user' || msg.role === 'assistant') chatTokens += msg.getTokens();
-                });
+
+                let addedTokens = 0;
+
+                // 🌟【核心修复】：直接将 ST-PT 数据永久合并到酒馆原生的全局变量中
+                for (const stat of processedSTPT.values()) {
+                    const textToMeasure = stat.rawText || '';
+                    if (textToMeasure.trim() === '') continue;
+
+                    const tk = await getTokenCountAsync(textToMeasure);
+                    addedTokens += tk;
+
+                    let finalBookName = stat.world || '未指定世界书';
+                    let finalEntryName = stat.comment || '未知条目';
+
+                    // 写入原生全局对象 wiDetailedStats
+                    if (!wiDetailedStats[finalBookName]) {
+                        wiDetailedStats[finalBookName] = { constant: [], dynamic: [], ejs: [], total: 0 };
+                    }
+                    if (!wiDetailedStats[finalBookName].ejs) {
+                        wiDetailedStats[finalBookName].ejs = [];
+                    }
+                    wiDetailedStats[finalBookName].ejs.push({
+                        name: finalEntryName,
+                        tokens: tk
+                    });
+                    wiDetailedStats[finalBookName].total += tk;
+                }
+
+                // 🌟 累加到原生全局 Token 变量
+                calculatedWiTokens += addedTokens;
+
+                // 🌟 强行触发 UI 刷新！因为全局变量已经修改，面板渲染将完美兼容 ST-PT 数据
+                updateTokenStatsUI();
+
+            } catch (err) {
+                console.error("[隐藏助手] 缝合 ST-PT 数据时出现异常:", err);
             }
-        }
-
-        // 4. 计算其他 Tokens，如果 ST-PT 注入到了聊天里导致负数，自动进行校准
-        let otherTokens = absoluteTotalTokens - chatTokens - calculatedWiTokens - stptTokensCount;
-        if (otherTokens < 0) {
-            chatTokens += otherTokens;
-            otherTokens = 0;
-        }
-
-        // 5. 调用渲染函数 (传入合并了 ST-PT 数据的统计对象)
-        renderTokenStatsContent(absoluteTotalTokens, chatTokens, wiTokens, otherTokens, combinedWiStats);
+        }, 800);
     });
 
     // --- 聊天统计事件监听结束 ---
 
-    // --- 新增：为"使用说明"面板初始化自定义滚动条 ---
-    try {
-        const instructionsPanel = document.getElementById('instructions-panel');
-        const contentContainer = document.getElementById('hide-helper-instructions-content');
-
-        if (instructionsPanel && contentContainer) {
-            const scrollbar = document.createElement('div');
-            // 使用在 CSS 中定义的、唯一的类名
-            scrollbar.className = 'k-scrollerbar-instructions';
-            instructionsPanel.prepend(scrollbar);
-
-            let scrollTimeout;
-            const handleScroll = () => {
-                // 1. 让滚动条可见
-                scrollbar.style.opacity = '1';
-
-                // 2. 获取必要的测量值
-                const { scrollHeight, clientHeight, scrollTop } = contentContainer;
-                // 修改：滚动条轨道的最大高度基于内容容器高度加上偏移量
-                const trackHeight = contentContainer.clientHeight + 34;
-                const totalScrollableDistance = scrollHeight - clientHeight;
-
-                if (totalScrollableDistance <= 0) {
-                    scrollbar.style.height = '0px';
-                    return;
-                }
-
-                // 3. 计算滚动进度 (0 到 1)
-                const scrollProgress = scrollTop / totalScrollableDistance;
-
-                // 4. 计算滚动条的新高度
-                const barHeight = trackHeight * scrollProgress;
-                scrollbar.style.height = `${barHeight}px`;
-
-                // 5. 设置计时器，在滚动停止0.75秒后隐藏滚动条
-                clearTimeout(scrollTimeout);
-                scrollTimeout = setTimeout(() => {
-                    scrollbar.style.opacity = '0';
-                }, 750); // 修改：延迟时间从 1500ms 减少到 750ms
-            };
-
-            contentContainer.addEventListener('scroll', handleScroll);
-        }
-    } catch (error) {
-        Logger.error('初始化使用说明面板自定义滚动条时发生错误:', error);
-    }
-    // --- 滚动条逻辑结束 ---
+    // --- 滚动条逻辑已彻底移除 ---
 
     // --- 弹窗和标签页交互 ---
+
+    // 记录弹窗打开会话期间是否已刷新过统计数据
+    let hasStatsRefreshedThisSession = false;
 
     $('#hide-helper-wand-button').on('click', function() {
         Logger.debug('魔杖按钮被点击');
@@ -1468,8 +1535,22 @@ function setupEventListeners() {
             titleEl.text('使用说明');
         }
 
-        // ---- 【新增这一行，打开弹窗立刻执行统计】 ----
+        // 恢复上一次切换的标签页
+        const lastActiveTab = extension_settings[extensionName].last_active_tab || 'hide-panel';
+        $('.tab-button').removeClass('active');
+        $(`.tab-button[data-tab="${lastActiveTab}"]`).addClass('active');
+        $('.tab-panel').removeClass('active');
+        $(`.tab-panel[data-tab="${lastActiveTab}"]`).addClass('active');
+
+        // 重置弹窗会话期间的统计刷新状态
+        hasStatsRefreshedThisSession = false;
+
+        // ---- 【打开弹窗立刻执行统计】 ----
         updateTokenStatsUI();
+        if (lastActiveTab === 'token-stats-panel') {
+            forceRefreshTokenStats(); // 如果用户一打开就是统计页，直接触发刷新
+            hasStatsRefreshedThisSession = true; // 标记本会话已刷新过
+        }
 
         const $popup = $('#hide-helper-popup');
         const $backdrop = $('#hide-helper-backdrop');
@@ -1494,6 +1575,16 @@ function setupEventListeners() {
         $(window).off('resize.hideHelperMain');
     });
 
+    // 新增: ESC键快速关闭弹窗
+    $(document).off('keydown.hideHelperEsc').on('keydown.hideHelperEsc', function(e) {
+        if (e.key === 'Escape' && $('#hide-helper-popup').is(':visible')) {
+            Logger.debug('ESC 键被按下，关闭弹窗');
+            $('#hide-helper-popup').hide();
+            $('#hide-helper-backdrop').hide();
+            $(window).off('resize.hideHelperMain');
+        }
+    });
+
     // 新增: 标签页切换逻辑
     $(document).on('click', '.tab-button', function() {
         const targetTab = $(this).data('tab');
@@ -1502,11 +1593,23 @@ function setupEventListeners() {
         $('.tab-panel').removeClass('active');
         $(`.tab-panel[data-tab="${targetTab}"]`).addClass('active');
 
+        // 保存当前选择的标签页
+        if (extension_settings[extensionName]) {
+            extension_settings[extensionName].last_active_tab = targetTab;
+            saveSettingsDebounced();
+        }
+
         // 如果切换到聊天统计标签，更新UI
         if (targetTab === 'token-stats-panel') {
-            updateTokenStatsUI();
-            // 这里删除了对 initTokenStatsScrollbar(); 的调用
+            updateTokenStatsUI(); // 先显示旧缓存数据防空白
+            if (!hasStatsRefreshedThisSession) {
+                forceRefreshTokenStats(); // 后台偷偷触发模拟生成，获取最新 EJS 数据
+                hasStatsRefreshedThisSession = true; // 标记本会话已刷新过
+            }
         }
+
+        // 面板内容切换极可能导致高度发生变化，重新计算定位确保依然完美居中
+        centerPopup($('#hide-helper-popup'));
     });
 
     // --- 全局插件开关 ---
@@ -1578,17 +1681,34 @@ function setupEventListeners() {
 
     // --- 面板2: Limiter 设置 ---
 
-    function onLimiterSettingsChange() {
+    // 加上 async 关键字，并接收事件对象 e 判断触发源
+    async function onLimiterSettingsChange(e) {
         if (_limiterSyncing) return;
         _limiterSyncing = true;
 
         try {
             const settings = extension_settings[extensionName];
             const isEnabled = $('#limiter-enabled').is(':checked');
-            const count = Number($('#limiter-count').val()) || 0;
 
-            settings.limiter_isEnabled = isEnabled;
-            saveSettingsDebounced();
+            // 1. 如果用户点击的是"功能开关"
+            if (e.target.id === 'limiter-enabled') {
+                settings.limiter_isEnabled = isEnabled;
+
+                if (isEnabled) {
+                    // 当再次启用时，立即读取酒馆原生的当前值
+                    let nativeTruncation = Number($('#chat_truncation').val());
+                    if (isNaN(nativeTruncation) || nativeTruncation <= 0) {
+                        nativeTruncation = power_user.chat_truncation || 0;
+                    }
+                    $('#limiter-count').val(nativeTruncation > 0 ? nativeTruncation : '');
+                }
+
+                // 立即更新 UI 显示（切换输入框与禁用文本的展示状态）
+                updateCurrentHideSettingsDisplay();
+            }
+
+            // 获取最新确定的数值
+            const count = parseInt($('#limiter-count').val(), 10) || 0;
 
             if (isEnabled && count > 0) {
                 // 同步到原生 chat_truncation
@@ -1596,38 +1716,43 @@ function setupEventListeners() {
                 if ($('#chat_truncation').length) {
                     $('#chat_truncation').val(count);
                     $('#chat_truncation_counter').val(count);
-                    // 【关键修复】：必须触发原生 input 和 change 事件，让酒馆原生的代码感知到修改并自动持久化保存
+                    // 触发原生事件更新UI（这虽然也会触发原生防抖，但不要紧，因为我们下面自己会立刻保存）
                     $('#chat_truncation').trigger('input').trigger('change');
                 }
-                // 立即生效：重载聊天
+            }
+
+            // 【使用 await saveSettings() 替代 saveSettingsDebounced()
+            // 强制直接发起网络请求将 settings.json 写入硬盘，防止手机浏览器冻结定时器导致保存丢失
+            await saveSettings();
+
+            // 仅在手动修改了数值，并且功能开启的情况下，才去重载聊天
+            // 如果仅仅是打开开关，由于读取的是原生的值，此时原生的限制其实早就应用了，无需重载引发卡顿
+            if (isEnabled && count > 0 && e.target.id === 'limiter-count') {
                 const { reloadCurrentChat } = getContext();
                 if (reloadCurrentChat) {
                     reloadCurrentChat();
                 }
             }
-            // 禁用时不修改 chat_truncation，不再干预原生消息加载机制
         } finally {
             _limiterSyncing = false;
         }
     }
     $('#limiter-enabled, #limiter-count').on('change', onLimiterSettingsChange);
 
-    // --- 双向同步: 原生 #chat_truncation 变更 → 插件状态同步 ---
+    // --- 单向同步: 原生 #chat_truncation 变更 → 仅当插件启用时更新UI ---
     $('#chat_truncation').on('input', function() {
         if (_limiterSyncing) return;
         _limiterSyncing = true;
 
         try {
-            // 【关键修复】：直接从原生 DOM 的 value 读取当前最新值，防止原生的事件执行顺序导致 power_user 对象还没及时更新
             const nativeValue = Number($(this).val()) || 0;
             const settings = extension_settings[extensionName];
 
-            settings.limiter_isEnabled = nativeValue > 0;
-            saveSettingsDebounced();
+            // 禁用状态下，完全不干预原生设置，也不自动开启插件
+            if (!settings.limiter_isEnabled) return;
 
-            // 如果弹窗当前可见，同步更新插件 UI
+            // 如果弹窗当前可见且功能已启用，仅同步更新插件 UI 上的数值
             if ($('#hide-helper-popup').is(':visible')) {
-                $('#limiter-enabled').prop('checked', settings.limiter_isEnabled);
                 $('#limiter-count').val(nativeValue > 0 ? nativeValue : '');
             }
         } finally {
