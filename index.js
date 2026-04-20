@@ -8,6 +8,7 @@ import { groups } from "../../../group-chats.js";
 import { power_user } from "../../../power-user.js";
 import { getTokenCountAsync } from "../../../tokenizers.js";
 import { promptManager } from "../../../openai.js";
+import { checkForUpdates, getChangelog, performUpdate, initUpdateCheck } from "./update.js";
 
 const extensionName = "hide";
 const defaultSettings = {
@@ -30,9 +31,18 @@ const defaultSettings = {
     },
     // --- Limiter 设置 ---
     limiter_isEnabled: false,
+    limiter_saved_count: 20, // 为被篡改时的还原备份
     limiter_migration_v2_complete: false,
     // --- 标签页状态保存 ---
     last_active_tab: 'hide-panel',
+    // --- 主题设置 ---
+    theme: 'light',
+    // --- 日志级别设置 ---
+    logLevel: 0, // 0=零日志(默认), 1=核心日志, 2=运行日志, 3=完整日志
+    // --- 主题提示设置 ---
+    theme_notification_viewed: false, // 是否已显示过主题切换提示
+    // --- 日志UI显示设置 ---
+    logUiVisible: false, // 控制日志级别选择器的显示/隐藏，默认隐藏
 };
 
 // Limiter 双向同步防重入标志
@@ -122,7 +132,7 @@ function setupSTPTInterceptor() {
                                 let exactEntryName = `[动态检索] ${keyword}`;
                                 let finalBookName = bookName || '当前世界书';
 
-                                // 🌟🌟🌟 步骤 B: 核心修复 - 利用 ST-PT 原生接口反查真实的条目名字！
+                                // 🌟🌟🌟 步骤 B: - 利用 ST-PT 原生接口反查真实的条目名字！
                                 // env.getWorldInfoData 是 ST-PT 暴露的获取世界书所有条目的方法
                                 if (typeof env.getWorldInfoData === 'function') {
                                     try {
@@ -193,6 +203,50 @@ const domCache = {
         });
     }
 };
+
+// --- 主题应用逻辑 ---
+function applyTheme(theme) {
+    if (theme === 'dark') {
+        $('#hide-helper-popup').attr('data-theme', 'dark');
+        $('#hide-helper-theme-toggle').html('<i class="fa-solid fa-sun"></i> 切换为亮色模式');
+    } else {
+        $('#hide-helper-popup').removeAttr('data-theme');
+        $('#hide-helper-theme-toggle').html('<i class="fa-solid fa-moon"></i> 切换为暗色模式');
+    }
+}
+
+// --- 主题提示弹窗辅助函数 ---
+function showThemeNotification() {
+    const $notification = $('#hide-helper-theme-notification');
+    if ($notification.length === 0) {
+        return;
+    }
+
+    // 使用 centerPopup 函数居中弹窗
+    $notification.show();
+    centerPopup($notification);
+
+    // 绑定窗口大小变化事件
+    $(window).off('resize.hideHelperNotification').on('resize.hideHelperNotification', () => centerPopup($notification));
+}
+
+function closeThemeNotification() {
+    const $notification = $('#hide-helper-theme-notification');
+    $(window).off('resize.hideHelperNotification');
+    $notification.fadeOut(300, function() {
+        $(this).remove();
+    });
+}
+
+// --- 日志级别应用逻辑 ---
+function applyLogLevel(level) {
+    Logger.setLogLevel(level);
+    $('#hide-helper-log-level-select').val(level);
+
+    // 更新日志级别显示文本
+    const levelTexts = ['零日志', '核心日志', '运行日志', '完整日志'];
+    $('#hide-helper-log-level-display').text(levelTexts[level] || '零日志');
+}
 
 /**
  * 通用弹窗居中函数
@@ -454,10 +508,19 @@ function createUI() {
     <div id="hide-helper-settings" class="hide-helper-container">
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b>隐藏助手</b>
+                <div style="display:flex; align-items:center;">
+                    <b>隐藏助手</b>
+                    <span id="hide-helper-new-badge" class="hide-new-badge" style="display: none;">NEW</span>
+                </div>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
+                <!-- 版本信息与更新检测 -->
+                <div class="hide-version-row">
+                    <span>当前版本: <span id="hide-helper-current-version">加载中...</span></span>
+                    <button id="hide-helper-check-update-btn" class="menu_button hide-update-btn">检查更新</button>
+                </div>
+
                 <div class="hide-helper-section">
                     <!-- 开启/关闭选项 -->
                     <div class="hide-helper-toggle-row">
@@ -468,7 +531,7 @@ function createUI() {
                         </select>
                     </div>
                 </div>
-                <div style="font-size: 12px; color: var(--text-secondary); margin-top: 8px;">点击聊天输入框左侧菜单按钮中的隐藏助手按钮，即可打开插件面板</div>
+                <div class="hide-settings-tip">点击聊天输入框左侧菜单按钮中的隐藏助手按钮，即可打开插件面板</div>
                 <hr class="sysHR">
             </div>
         </div>
@@ -528,7 +591,7 @@ function createPopup() {
                         </div>
                     </div>
 
-                    <div class="limiter-setting-item" id="hide-disabled-msg" style="display: none; justify-content: center; color: var(--text-secondary);">
+                    <div class="limiter-setting-item" id="hide-disabled-msg">
                         当前隐藏楼层功能已禁用
                     </div>
 
@@ -551,7 +614,7 @@ function createPopup() {
                                 <span class="hide-helper-slider"></span>
                             </label>
                         </div>
-                        <div class="hide-helper-popup-footer" style="display: flex; justify-content: center;">
+                        <div class="hide-helper-popup-footer hide-helper-popup-footer-center">
                             <button id="hide-unhide-all-btn" class="hide-helper-btn">
                                 <i class="fa-solid fa-eye-slash"></i> 立即将当前聊天所有楼层取消隐藏
                             </button>
@@ -616,7 +679,7 @@ function createPopup() {
                         <label for="limiter-count">加载的消息楼层数量</label>
                         <input id="limiter-count" type="number" class="text_pole" min="0" max="1000" step="1" placeholder="例如: 20">
                     </div>
-                    <div class="limiter-setting-item" id="limiter-disabled-msg" style="display: none; justify-content: center; color: var(--text-secondary);">
+                    <div class="limiter-setting-item" id="limiter-disabled-msg">
                         当前限制楼层功能已禁用
                     </div>
                     <div class="limiter-description">
@@ -636,7 +699,37 @@ function createPopup() {
                 <!-- 面板4: 使用说明 -->
                 <div id="instructions-panel" class="tab-panel" data-tab="instructions-panel">
                     <div id="hide-helper-instructions-content" class="hide-helper-instructions-content">
-                        
+
+                        <!-- 主题切换按钮 -->
+                        <div class="theme-switch-container">
+                            <span class="theme-switch-label">UI主题</span>
+                            <button id="hide-helper-theme-toggle" class="hide-helper-btn">
+                                <i class="fa-solid fa-moon"></i> 切换为暗色模式
+                            </button>
+                        </div>
+
+                        <!-- 日志UI显示开关 -->
+                        <div class="log-ui-toggle-container">
+                            <label for="hide-helper-log-ui-toggle" class="log-ui-toggle-label">显示日志</label>
+                            <div class="hide-helper-checkbox-container">
+                                <input id="hide-helper-log-ui-toggle" type="checkbox">
+                                <label for="hide-helper-log-ui-toggle"></label>
+                            </div>
+                        </div>
+
+                        <!-- 日志级别选择器（默认隐藏） -->
+                        <div class="log-level-selector-wrapper" style="display: none;">
+                        <div class="log-level-switch-container">
+                            <span class="log-level-label">日志级别</span>
+                            <select id="hide-helper-log-level-select" class="hide-helper-select log-level-select">
+                                <option value="0">零日志 (无输出)</option>
+                                <option value="1">核心日志 (错误+警告)</option>
+                                <option value="2">运行日志 (全部运行信息)</option>
+                                <option value="3">完整日志 (含调试)</option>
+                            </select>
+                        </div>
+                        </div>
+
                         <video class="instructions-video" controls muted loop playsinline>
                             <source src="https://files.catbox.moe/wmv5bd.mp4" type="video/mp4">
                             您的浏览器不支持 Video 标签。
@@ -695,6 +788,35 @@ function createPopup() {
         </div>`;
     Logger.debug('追加弹窗 HTML 到 body');
     $('body').append(popupHtml);
+
+    // 添加更新弹窗的遮罩层
+    const overlayHtml = `<div id="hide-helper-modal-overlay" class="hide-modal-overlay"></div>`;
+    if ($('#hide-helper-modal-overlay').length === 0) {
+        $('body').append(overlayHtml);
+    }
+
+    // 添加主题提示弹窗的HTML（如果需要显示）
+    if (!extension_settings[extensionName].theme_notification_viewed) {
+        const notificationHtml = `
+            <div id="hide-helper-theme-notification" class="hide-helper-notification-popup">
+                <div class="notification-content">
+                    <div class="notification-icon">
+                        <i class="fa-solid fa-moon"></i>
+                    </div>
+                    <h3>插件现已提供白天/黑夜两套UI主题</h3>
+                    <p>可以在【使用说明】页面进行切换。</p>
+                    <div class="notification-buttons">
+                        <button id="hide-helper-switch-theme-now" class="hide-helper-btn notification-primary-btn">
+                            <i class="fa-solid fa-moon"></i> 立即切换到黑夜主题
+                        </button>
+                        <button id="hide-helper-notification-close" class="hide-helper-btn notification-secondary-btn">
+                            我已知晓
+                        </button>
+                    </div>
+                </div>
+            </div>`;
+        $('body').append(notificationHtml);
+    }
 }
 
 // 获取当前应该使用的隐藏设置 (从全局 extension_settings 读取)
@@ -812,11 +934,13 @@ function updateCurrentHideSettingsDisplay() {
     $('#hide-mode-description').text(useGlobal ? '隐藏将应用于所有角色卡' : '隐藏仅对当前角色卡生效');
 
 	// --- 更新 Limiter 面板 ---
-    // 优先从底层内存变量 power_user 读取，避免网页刷新时被原生 DOM 的 step="5" 属性强行四舍五入污染数值
-    let nativeTruncation = power_user.chat_truncation;
-    if (typeof nativeTruncation !== 'number' || isNaN(nativeTruncation) || nativeTruncation <= 0) {
-        // 如果底层没有有效数据，再尝试从 DOM 读取作为兜底
-        nativeTruncation = Number($('#chat_truncation').val()) || 0;
+    // 优先从插件自身的影子变量读取（防篡改兜底），其次读底层，最后读DOM
+    let nativeTruncation = extension_settings[extensionName].limiter_saved_count;
+    if (!nativeTruncation || nativeTruncation <= 0) {
+        nativeTruncation = power_user.chat_truncation;
+        if (typeof nativeTruncation !== 'number' || isNaN(nativeTruncation) || nativeTruncation <= 0) {
+            nativeTruncation = Number($('#chat_truncation').val()) || 0;
+        }
     }
 
     const isLimiterEnabled = extension_settings[extensionName].limiter_isEnabled;
@@ -1207,10 +1331,10 @@ function renderTokenStatsContent(totalTokens, chatTokens, wiTokens, otherTokens,
     }
 
     const sectionHtml = `
-        <div id="tub-entries-header-sticky" style="position: sticky; top: -1px; background-color: var(--background-popup); z-index: 10; padding-top: 10px; padding-bottom: 5px; margin-left: -5px; padding-left: 5px">
-            <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 10px;">
-                <div style="display: flex; align-items: center; gap: 8px;">
-                    <div class="tub-section-title tub-title-text" style="margin-bottom:0;">已激活条目</div>
+        <div id="tub-entries-header-sticky" class="tub-entries-header-sticky">
+            <div class="tub-flex-row-between">
+                <div class="tub-flex-row-center">
+                    <div class="tub-section-title tub-title-text tub-section-title-no-margin">已激活条目</div>
                     <div class="tub-search-wrapper">
                         <svg class="tub-search-icon" id="tub-search-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
@@ -1218,7 +1342,7 @@ function renderTokenStatsContent(totalTokens, chatTokens, wiTokens, otherTokens,
                         <input type="text" id="tub-search-input" class="tub-search-input" placeholder="搜索条目...">
                     </div>
                 </div>
-                <div id="tub-entries-total-display" style="font-size: 0.85em; font-weight: bold; color: #343a40 !important;"></div>
+                <div id="tub-entries-total-display" class="tub-entries-total-display"></div>
             </div>
             ${filtersHtml}
         </div>
@@ -1272,8 +1396,8 @@ function renderTokenStatsContent(totalTokens, chatTokens, wiTokens, otherTokens,
         const filterTotal = filterTotalC + filterTotalD + filterTotalE;
         // 构建顶部总数显示，如果有 EJS 则显示红色部分
         let totalHtml = `${filterTotal} (`;
-        if (filterTotalE > 0) totalHtml += `<span style="color:#ef4444 !important;">${filterTotalE}</span> + `;
-        totalHtml += `<span style="color:#22c55e !important;">${filterTotalD}</span> + <span style="color:#3b82f6 !important;">${filterTotalC}</span>)`;
+        if (filterTotalE > 0) totalHtml += `<span class="tub-stat-color-ejs">${filterTotalE}</span> + `;
+        totalHtml += `<span class="tub-stat-color-dynamic">${filterTotalD}</span> + <span class="tub-stat-color-constant">${filterTotalC}</span>)`;
         totalDisplay.innerHTML = totalHtml;
 
         combined.sort((a, b) => {
@@ -1283,7 +1407,7 @@ function renderTokenStatsContent(totalTokens, chatTokens, wiTokens, otherTokens,
         });
 
         if (!combined.length) {
-            entriesContainer.innerHTML = '<div style="text-align:center;color:#868e96;padding:10px 0; direction: ltr !important;">没有激活的条目</div>';
+            entriesContainer.innerHTML = '<div class="tub-empty-state">没有激活的条目</div>';
             return;
         }
 
@@ -1291,16 +1415,15 @@ function renderTokenStatsContent(totalTokens, chatTokens, wiTokens, otherTokens,
 
         combined.forEach(e => {
             const pct = absoluteMax > 0 ? ((e.tokens / absoluteMax) * 100).toFixed(1) : 0;
-            const bookTag = (currentBookFilter === 'all' && books.length > 1) ? ` <span style="color:#868e96;font-size:0.85em;font-weight:normal;">(${e.b})</span>` : '';
+            const bookTag = (currentBookFilter === 'all' && books.length > 1) ? ` <span class="tub-book-tag">(${e.b})</span>` : '';
 
             let gradientBg = '';
             if (e.type === 'ejs') {
-                // EJS 专属浅红背景色
-                gradientBg = `background: linear-gradient(to right, #fee2e2 ${pct}%, #f8fafc ${pct}%);`;
+                gradientBg = `background: linear-gradient(to right, var(--stats-bg-ejs) ${pct}%, transparent ${pct}%);`;
             } else if (e.type === 'constant') {
-                gradientBg = `background: linear-gradient(to right, #dbeafe ${pct}%, #f8fafc ${pct}%);`;
+                gradientBg = `background: linear-gradient(to right, var(--stats-bg-constant) ${pct}%, transparent ${pct}%);`;
             } else {
-                gradientBg = `background: linear-gradient(to right, #dcfce7 ${pct}%, #f8fafc ${pct}%);`;
+                gradientBg = `background: linear-gradient(to right, var(--stats-bg-dynamic) ${pct}%, transparent ${pct}%);`;
             }
 
             entriesContainer.insertAdjacentHTML('beforeend', `
@@ -1352,7 +1475,7 @@ function renderTokenStatsContent(totalTokens, chatTokens, wiTokens, otherTokens,
 // 渲染饼图 (增加 EJS 红色切片)
 function renderPieView(c, d, e, total) {
     const container = document.getElementById('tub-row-wi-chart');
-    if (!total) { container.innerHTML = '<div style="color:#868e96 !important;">没有激活的世界书</div>'; return; }
+    if (!total) { container.innerHTML = '<div class="tub-empty-state">没有激活的世界书</div>'; return; }
 
     const cPct = (c / total) * 100;
     const dPct = (d / total) * 100;
@@ -1381,9 +1504,9 @@ function renderPieView(c, d, e, total) {
             ${ePct >= 5 ? `<span class="tub-pie-text" style="left: ${eX}px; top: ${eY}px;">${ePct.toFixed(0)}%</span>` : ''}
         </div>
         <div class="tub-legend">
-            ${e > 0 ? `<div style="display:flex; align-items:center;"><span class="tub-dot tub-dot-red"></span>EJS: ${e}</div>` : ''}
-            <div style="display:flex; align-items:center;"><span class="tub-dot tub-dot-green"></span>绿灯: ${d}</div>
-            <div style="display:flex; align-items:center;"><span class="tub-dot tub-dot-blue"></span>蓝灯: ${c}</div>
+            ${e > 0 ? `<div class="tub-legend-item"><span class="tub-dot tub-dot-red"></span>EJS: ${e}</div>` : ''}
+            <div class="tub-legend-item"><span class="tub-dot tub-dot-green"></span>绿灯: ${d}</div>
+            <div class="tub-legend-item"><span class="tub-dot tub-dot-blue"></span>蓝灯: ${c}</div>
         </div>
     `;
 }
@@ -1393,6 +1516,92 @@ function initScrollbarLogic() {
 }
 
 // ==================== 聊天统计功能结束 ====================
+
+// --- 更新日志弹窗 ---
+function createChangelogModalHtml(changelogText) {
+    return `
+    <div class="hide-modal-box" id="hide-helper-modal-update">
+        <div class="hide-modal-header">插件更新日志</div>
+        <div class="hide-changelog-viewer" id="hide-helper-changelog-content">${changelogText}</div>
+        <div class="hide-update-tip">如果更新失败，可以在酒馆扩展页面的【管理扩展程序】列表中手动更新隐藏助手。如果依然更新失败，则可以尝试删除重装来使用最新版本插件。</div>
+        <div class="hide-modal-footer">
+            <button id="hide-helper-btn-confirm-update" class="menu_button primary">立即更新</button>
+            <button class="menu_button" onclick="document.getElementById('hide-helper-modal-overlay').classList.remove('visible')">取消</button>
+        </div>
+    </div>`;
+}
+
+async function showUpdateModal() {
+    const overlay = document.getElementById('hide-helper-modal-overlay');
+    if (!overlay) return;
+
+    // 先显示 Loading
+    overlay.innerHTML = `<div class="hide-modal-box" style="text-align:center; padding:30px;">Loading changelog...</div>`;
+    overlay.classList.add('visible');
+
+    const changelog = await getChangelog();
+
+    // 简单的 Markdown 转义处理
+    const safeLog = changelog.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+    overlay.innerHTML = createChangelogModalHtml(safeLog);
+
+    const btnUpdate = document.getElementById('hide-helper-btn-confirm-update');
+    if (btnUpdate) {
+        btnUpdate.onclick = async () => {
+            if (confirm('更新操作将刷新页面，请确保已保存对话。\n确定更新吗？')) {
+                btnUpdate.disabled = true;
+                btnUpdate.textContent = "更新中...";
+                try {
+                    const res = await performUpdate();
+                    if (res.ok) {
+                        alert('更新指令已发送，页面即将刷新。');
+                        setTimeout(() => location.reload(), 2000);
+                    } else {
+                        alert('更新失败，请查看控制台日志。');
+                        btnUpdate.disabled = false;
+                    }
+                } catch (e) {
+                    alert('更新请求发生错误: ' + e);
+                    btnUpdate.disabled = false;
+                }
+            }
+        };
+    }
+}
+
+/**
+ * 更新版本显示
+ */
+function updateVersionDisplay(updateInfo) {
+    if (!updateInfo) return;
+
+    const currentVersionEl = $('#hide-helper-current-version');
+    const newBadgeEl = $('#hide-helper-new-badge');
+    const checkBtn = $('#hide-helper-check-update-btn');
+
+    if (currentVersionEl.length) {
+        currentVersionEl.text(updateInfo.localVersion || 'Unknown');
+    }
+
+    if (newBadgeEl.length) {
+        if (updateInfo.hasUpdate) {
+            newBadgeEl.show();
+            if (checkBtn.length) {
+                checkBtn.addClass('has-update');
+                checkBtn.text('发现新版本');
+                checkBtn.attr('title', `最新版本: ${updateInfo.latestVersion}`);
+            }
+        } else {
+            newBadgeEl.hide();
+            if (checkBtn.length) {
+                checkBtn.removeClass('has-update');
+                checkBtn.text('检查更新');
+                checkBtn.removeAttr('title');
+            }
+        }
+    }
+}
 
 // 设置UI元素的事件监听器
 function setupEventListeners() {
@@ -1508,8 +1717,6 @@ function setupEventListeners() {
 
     // --- 聊天统计事件监听结束 ---
 
-    // --- 滚动条逻辑已彻底移除 ---
-
     // --- 弹窗和标签页交互 ---
 
     // 记录弹窗打开会话期间是否已刷新过统计数据
@@ -1528,7 +1735,7 @@ function setupEventListeners() {
         // 首次打开时显示红色括号说明提示
         const titleEl = $('#hide-panel-instructions-title');
         if (!extension_settings[extensionName].hide_instructions_viewed) {
-            titleEl.html('使用说明<span style="color: red;">（向下滑查看完整内容）</span>');
+            titleEl.html('使用说明<span class="title-warning-text">（向下滑查看完整内容）</span>');
             extension_settings[extensionName].hide_instructions_viewed = true;
             saveSettingsDebounced();
         } else {
@@ -1558,6 +1765,19 @@ function setupEventListeners() {
         $popup.show();
         centerPopup($popup);
         $(window).off('resize.hideHelperMain').on('resize.hideHelperMain', () => centerPopup($popup));
+
+        // 恢复日志UI开关状态
+        $('#hide-helper-log-ui-toggle').prop('checked', extension_settings[extensionName].logUiVisible || false);
+        if (extension_settings[extensionName].logUiVisible) {
+            $('.log-level-selector-wrapper').slideDown(0);
+        } else {
+            $('.log-level-selector-wrapper').slideUp(0);
+        }
+
+        // 显示主题提示弹窗（如果是首次打开）
+        if (!extension_settings[extensionName].theme_notification_viewed) {
+            showThemeNotification();
+        }
     });
 
     $('#hide-helper-popup-close-icon').on('click', function() {
@@ -1582,6 +1802,116 @@ function setupEventListeners() {
             $('#hide-helper-popup').hide();
             $('#hide-helper-backdrop').hide();
             $(window).off('resize.hideHelperMain');
+        }
+    });
+
+    // --- 主题切换事件 ---
+    $(document).on('click', '#hide-helper-theme-toggle', function() {
+        const currentTheme = extension_settings[extensionName].theme || 'light';
+        const newTheme = currentTheme === 'light' ? 'dark' : 'light';
+        extension_settings[extensionName].theme = newTheme;
+        applyTheme(newTheme);
+        saveSettingsDebounced();
+
+        // 实时重新渲染聊天统计，以更新行内的渐变色
+        if ($('.tab-panel[data-tab="token-stats-panel"]').hasClass('active')) {
+            updateTokenStatsUI();
+        }
+    });
+
+    // --- 日志级别切换事件 ---
+    $(document).on('change', '#hide-helper-log-level-select', function() {
+        const newLevel = parseInt($(this).val());
+        extension_settings[extensionName].logLevel = newLevel;
+        applyLogLevel(newLevel);
+        saveSettingsDebounced();
+
+        // 输出一条提示消息确认日志级别已更改
+        if (newLevel > 0) {
+            console.log(`%c[隐藏助手]`, 'font-weight: bold; color: #28a745;', `日志级别已更改为: ${['零日志', '核心日志', '运行日志', '完整日志'][newLevel]}`);
+        }
+    });
+
+    // --- 主题提示弹窗事件 ---
+
+    // 立即切换主题按钮
+    $(document).on('click', '#hide-helper-switch-theme-now', function() {
+        const newTheme = 'dark';
+        extension_settings[extensionName].theme = newTheme;
+        applyTheme(newTheme);
+        extension_settings[extensionName].theme_notification_viewed = true;
+        saveSettingsDebounced();
+        closeThemeNotification();
+
+        // 实时重新渲染聊天统计
+        if ($('.tab-panel[data-tab="token-stats-panel"]').hasClass('active')) {
+            updateTokenStatsUI();
+        }
+    });
+
+    // 我已知晓按钮
+    $(document).on('click', '#hide-helper-notification-close', function() {
+        extension_settings[extensionName].theme_notification_viewed = true;
+        saveSettingsDebounced();
+        closeThemeNotification();
+    });
+
+    // --- 日志UI显示开关事件 ---
+    $(document).on('change', '#hide-helper-log-ui-toggle', function() {
+        const isVisible = $(this).is(':checked');
+        extension_settings[extensionName].logUiVisible = isVisible;
+        saveSettingsDebounced();
+
+        const $logLevelWrapper = $('.log-level-selector-wrapper');
+        if (isVisible) {
+            $logLevelWrapper.slideDown(200);
+        } else {
+            $logLevelWrapper.slideUp(200);
+        }
+    });
+
+    // --- 更新检测按钮事件 ---
+    $(document).on('click', '#hide-helper-check-update-btn', async function(e) {
+        e.stopPropagation();
+        const btn = $(this);
+
+        // 如果已经是红色状态(有更新)，点击则弹出更新日志并确认
+        if (btn.hasClass('has-update')) {
+            showUpdateModal();
+        } else {
+            const originalText = btn.text();
+
+            // 禁用按钮，防止重复点击
+            btn.prop('disabled', true);
+            btn.text('检测中...');
+
+            try {
+                // 强制检查更新
+                const updateInfo = await checkForUpdates(true);
+                updateVersionDisplay(updateInfo);
+
+                if (updateInfo.hasUpdate) {
+                    toastr.success(`发现新版本: ${updateInfo.latestVersion}`);
+                } else {
+                    // 增加错误兜底判断，网络不通时不再骗你是最新版
+                    if (updateInfo.latestVersion === "Check Failed") {
+                        toastr.error('检测失败，无法连接到 GitHub 仓库');
+                        btn.text('检测失败');
+                    } else {
+                        toastr.info('当前已是最新版本');
+                        btn.text('已是最新');
+                    }
+                    setTimeout(() => {
+                        btn.text('检查更新');
+                    }, 2000);
+                }
+            } catch (err) {
+                Logger.error('检测更新失败:', err);
+                toastr.error('检测更新失败，请稍后重试');
+                btn.text(originalText);
+            } finally {
+                btn.prop('disabled', false);
+            }
         }
     });
 
@@ -1695,15 +2025,18 @@ function setupEventListeners() {
                 settings.limiter_isEnabled = isEnabled;
 
                 if (isEnabled) {
-                    // 当再次启用时，立即读取酒馆原生的当前值
-                    let nativeTruncation = Number($('#chat_truncation').val());
-                    if (isNaN(nativeTruncation) || nativeTruncation <= 0) {
-                        nativeTruncation = power_user.chat_truncation || 0;
+                    // 当再次启用时，优先抓取酒馆原生的当前值
+                    // （因为在插件关闭期间，用户可能在原生界面修改过）
+                    let currentNative = Number($('#chat_truncation').val());
+                    if (isNaN(currentNative) || currentNative <= 0) {
+                        currentNative = power_user.chat_truncation || 0;
                     }
-                    $('#limiter-count').val(nativeTruncation > 0 ? nativeTruncation : '');
+                    if (currentNative > 0) {
+                        settings.limiter_saved_count = currentNative;
+                    }
                 }
 
-                // 立即更新 UI 显示（切换输入框与禁用文本的展示状态）
+                // 立即更新 UI 显示
                 updateCurrentHideSettingsDisplay();
             }
 
@@ -1711,22 +2044,22 @@ function setupEventListeners() {
             const count = parseInt($('#limiter-count').val(), 10) || 0;
 
             if (isEnabled && count > 0) {
+                // 【核心同步】：将用户设定的值永久保存到插件的影子变量中
+                settings.limiter_saved_count = count;
+
                 // 同步到原生 chat_truncation
                 power_user.chat_truncation = count;
                 if ($('#chat_truncation').length) {
                     $('#chat_truncation').val(count);
                     $('#chat_truncation_counter').val(count);
-                    // 触发原生事件更新UI（这虽然也会触发原生防抖，但不要紧，因为我们下面自己会立刻保存）
-                    $('#chat_truncation').trigger('input').trigger('change');
+                    $('#chat_truncation').trigger('change'); // 触发原生保存
                 }
             }
 
-            // 【使用 await saveSettings() 替代 saveSettingsDebounced()
-            // 强制直接发起网络请求将 settings.json 写入硬盘，防止手机浏览器冻结定时器导致保存丢失
+            // 强制落盘保存到 settings.json
             await saveSettings();
 
-            // 仅在手动修改了数值，并且功能开启的情况下，才去重载聊天
-            // 如果仅仅是打开开关，由于读取的是原生的值，此时原生的限制其实早就应用了，无需重载引发卡顿
+            // 如果手动改了输入框的数值，重载当前聊天
             if (isEnabled && count > 0 && e.target.id === 'limiter-count') {
                 const { reloadCurrentChat } = getContext();
                 if (reloadCurrentChat) {
@@ -1739,7 +2072,7 @@ function setupEventListeners() {
     }
     $('#limiter-enabled, #limiter-count').on('change', onLimiterSettingsChange);
 
-    // --- 单向同步: 原生 #chat_truncation 变更 → 仅当插件启用时更新UI ---
+    // --- 【原生界面修改反向同步】: 原生 #chat_truncation 变更 → 插件影子变量 ---
     $('#chat_truncation').on('input', function() {
         if (_limiterSyncing) return;
         _limiterSyncing = true;
@@ -1748,11 +2081,15 @@ function setupEventListeners() {
             const nativeValue = Number($(this).val()) || 0;
             const settings = extension_settings[extensionName];
 
-            // 禁用状态下，完全不干预原生设置，也不自动开启插件
-            if (!settings.limiter_isEnabled) return;
+            // 【静默守护】：无论插件是否开启，只要用户手动在原生界面修改了，就立刻更新影子变量备份
+            if (nativeValue > 0) {
+                settings.limiter_saved_count = nativeValue;
+                // 仅保存插件数据，不需要全量刷新UI
+                saveSettingsDebounced();
+            }
 
-            // 如果弹窗当前可见且功能已启用，仅同步更新插件 UI 上的数值
-            if ($('#hide-helper-popup').is(':visible')) {
+            // 如果插件启用了且弹窗打开着，顺便把弹窗里的输入框数值也变一下，做到视觉统一
+            if (settings.limiter_isEnabled && $('#hide-helper-popup').is(':visible')) {
                 $('#limiter-count').val(nativeValue > 0 ? nativeValue : '');
             }
         } finally {
@@ -1799,6 +2136,18 @@ function setupEventListeners() {
         }
     });
 
+    // ============================================================
+    // 防止操作弹窗时导致背后的 ST 扩展面板关闭
+    // ============================================================
+    const overlay = document.getElementById('hide-helper-modal-overlay');
+    if (overlay) {
+        const stopPropagation = (e) => { e.stopPropagation(); };
+        overlay.addEventListener('mousedown', stopPropagation);
+        overlay.addEventListener('touchstart', stopPropagation);
+        overlay.addEventListener('click', stopPropagation);
+        overlay.addEventListener('wheel', stopPropagation, { passive: true });
+    }
+
     Logger.debug('事件监听器设置完成');
 }
 
@@ -1820,12 +2169,43 @@ jQuery(async () => {
         // 1. 加载设置并触发迁移检查
         loadSettings();
 
+        // 🌟【核心修复】强制镇压手机端 ST 的偷偷重置行为
+        const settings = extension_settings[extensionName];
+        if (settings.limiter_isEnabled && settings.limiter_saved_count > 0) {
+            // 如果底层当前值与我们保存的影子变量不一致（比如被手机端偷改成了20）
+            if (power_user.chat_truncation !== settings.limiter_saved_count) {
+                Logger.warn(`检测到底层加载数(${power_user.chat_truncation})被篡改，强制恢复为设定值: ${settings.limiter_saved_count}`);
+                // 强行覆盖底层变量
+                power_user.chat_truncation = settings.limiter_saved_count;
+                // 强行覆盖 DOM
+                if ($('#chat_truncation').length) {
+                    $('#chat_truncation').val(settings.limiter_saved_count);
+                    $('#chat_truncation_counter').val(settings.limiter_saved_count);
+                }
+                // 让酒馆重新保存 settings.json
+                saveSettingsDebounced();
+            }
+        }
+
         // 2. 创建 UI (现在依赖于 loadSettings 完成初始化和迁移检查)
         createUI();
+
+        // 2.5 初始化更新检测
+        initUpdateCheck().then(updateInfo => {
+            if (updateInfo) {
+                updateVersionDisplay(updateInfo);
+            }
+        });
 
         // 3. 更新初始 UI 状态
         Logger.debug('初始设置: 设置全局开关显示');
         $('#hide-helper-toggle').val(extension_settings[extensionName]?.enabled ? 'enabled' : 'disabled');
+
+        // 应用保存的主题
+        applyTheme(settings.theme || 'light');
+
+        // 应用保存的日志级别
+        applyLogLevel(settings.logLevel || 0);
 
         Logger.debug('初始设置: 更新当前隐藏设置显示');
         updateCurrentHideSettingsDisplay();

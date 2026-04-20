@@ -10,21 +10,74 @@ const STYLES = {
     debug:   `${BASE_STYLE} color: #6c757d; background-color: #f8f9fa; border: 1px solid #dee2e6;` // 灰色 - 调试
 };
 
+// 日志级别定义
+const LogLevel = {
+    NONE: 0,      // 零日志 - 无任何输出
+    CORE: 1,      // 核心日志 - error + warn
+    RUNTIME: 2,   // 运行日志 - error + warn + info + success
+    FULL: 3       // 完整日志 - 所有日志包括 debug
+};
+
 class Logger {
-    // 基础信息
-    static info(...args) { console.log(PREFIX, STYLES.info, ...args); }
-    // 成功提示
-    static success(...args) { console.log(PREFIX, STYLES.success, ...args); }
-    // 警告提示
-    static warn(...args) { console.warn(PREFIX, STYLES.warn, ...args); }
-    // 错误提示
-    static error(...args) { console.error(PREFIX, STYLES.error, ...args); }
-    // 调试信息（默认静默，需在控制台输入 window.HideHelperDebug = true 开启）
+    // 当前日志级别（默认为零日志）
+    static currentLevel = LogLevel.NONE;
+
+    // 设置日志级别
+    static setLogLevel(level) {
+        if (level in LogLevel) {
+            this.currentLevel = LogLevel[level];
+        } else if (typeof level === 'number' && level >= 0 && level <= 3) {
+            this.currentLevel = level;
+        }
+    }
+
+    // 获取日志级别
+    static getLogLevel() {
+        return this.currentLevel;
+    }
+
+    // 检查是否应该输出日志
+    static shouldLog(level) {
+        return this.currentLevel >= level;
+    }
+
+    // 错误提示（级别 1 - 核心日志）
+    static error(...args) {
+        if (this.shouldLog(LogLevel.CORE)) {
+            console.error(PREFIX, STYLES.error, ...args);
+        }
+    }
+
+    // 警告提示（级别 1 - 核心日志）
+    static warn(...args) {
+        if (this.shouldLog(LogLevel.CORE)) {
+            console.warn(PREFIX, STYLES.warn, ...args);
+        }
+    }
+
+    // 基础信息（级别 2 - 运行日志）
+    static info(...args) {
+        if (this.shouldLog(LogLevel.RUNTIME)) {
+            console.log(PREFIX, STYLES.info, ...args);
+        }
+    }
+
+    // 成功提示（级别 2 - 运行日志）
+    static success(...args) {
+        if (this.shouldLog(LogLevel.RUNTIME)) {
+            console.log(PREFIX, STYLES.success, ...args);
+        }
+    }
+
+    // 调试信息（级别 3 - 完整日志）
     static debug(...args) {
-        if (window.HideHelperDebug) {
+        if (this.shouldLog(LogLevel.FULL)) {
             console.debug(PREFIX, STYLES.debug, ...args);
         }
     }
 }
+
+// 导出日志级别常量，供外部使用
+Logger.LogLevel = LogLevel;
 
 export default Logger;
