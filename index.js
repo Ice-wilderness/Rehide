@@ -206,11 +206,13 @@ const domCache = {
 
 // --- 主题应用逻辑 ---
 function applyTheme(theme) {
+    // 同时寻找主弹窗、更新遮罩层、通知弹窗，赋予独立的局部主题标识
+    const targets = $('#hide-helper-popup, .hide-modal-overlay, #hide-helper-theme-notification');
     if (theme === 'dark') {
-        $('#hide-helper-popup').attr('data-theme', 'dark');
+        targets.attr('data-theme', 'dark');
         $('#hide-helper-theme-toggle').html('<i class="fa-solid fa-sun"></i> 切换为亮色模式');
     } else {
-        $('#hide-helper-popup').removeAttr('data-theme');
+        targets.removeAttr('data-theme');
         $('#hide-helper-theme-toggle').html('<i class="fa-solid fa-moon"></i> 切换为暗色模式');
     }
 }
