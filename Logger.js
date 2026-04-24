@@ -21,6 +21,48 @@ const LogLevel = {
 class Logger {
     // 当前日志级别（默认为零日志）
     static currentLevel = LogLevel.NONE;
+    // 日志历史记录数组，用于导出
+    static logHistory = [];
+
+    // 将日志推送到内存中（严格限制：仅在完整日志级别3时才执行，保障性能）
+    static pushToHistory(levelName, ...args) {
+        if (this.currentLevel !== LogLevel.FULL) return;
+
+        const timestamp = new Date().toLocaleString('zh-CN', { hour12: false });
+        const message = args.map(arg => {
+            if (typeof arg === 'object') {
+                try {
+                    return JSON.stringify(arg, (key, value) => {
+                        if (key === 'parent' || key === 'dom' || key === 'collection') return '[已省略嵌套对象]';
+                        return value;
+                    });
+                } catch(e) { return '[复杂对象/解析失败]'; }
+            }
+            return String(arg);
+        }).join(' ');
+
+        this.logHistory.push(`[${timestamp}] [${levelName}] ${message}`);
+
+        // 限制内存中最多保存最近 500 条日志
+        if (this.logHistory.length > 500) {
+            this.logHistory.shift();
+        }
+    }
+
+    // 导出并下载日志
+    static exportLogs() {
+        if (this.logHistory.length === 0) return false;
+        const blob = new Blob([this.logHistory.join('\n')], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `HideHelper_DebugLog_${new Date().getTime()}.log`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        return true;
+    }
 
     // 设置日志级别
     static setLogLevel(level) {
@@ -43,37 +85,32 @@ class Logger {
 
     // 错误提示（级别 1 - 核心日志）
     static error(...args) {
-        if (this.shouldLog(LogLevel.CORE)) {
-            console.error(PREFIX, STYLES.error, ...args);
-        }
+        this.pushToHistory('ERROR', ...args);
+        if (this.shouldLog(LogLevel.CORE)) console.error(PREFIX, STYLES.error, ...args);
     }
 
     // 警告提示（级别 1 - 核心日志）
     static warn(...args) {
-        if (this.shouldLog(LogLevel.CORE)) {
-            console.warn(PREFIX, STYLES.warn, ...args);
-        }
+        this.pushToHistory('WARN', ...args);
+        if (this.shouldLog(LogLevel.CORE)) console.warn(PREFIX, STYLES.warn, ...args);
     }
 
     // 基础信息（级别 2 - 运行日志）
     static info(...args) {
-        if (this.shouldLog(LogLevel.RUNTIME)) {
-            console.log(PREFIX, STYLES.info, ...args);
-        }
+        this.pushToHistory('INFO', ...args);
+        if (this.shouldLog(LogLevel.RUNTIME)) console.log(PREFIX, STYLES.info, ...args);
     }
 
     // 成功提示（级别 2 - 运行日志）
     static success(...args) {
-        if (this.shouldLog(LogLevel.RUNTIME)) {
-            console.log(PREFIX, STYLES.success, ...args);
-        }
+        this.pushToHistory('SUCCESS', ...args);
+        if (this.shouldLog(LogLevel.RUNTIME)) console.log(PREFIX, STYLES.success, ...args);
     }
 
     // 调试信息（级别 3 - 完整日志）
     static debug(...args) {
-        if (this.shouldLog(LogLevel.FULL)) {
-            console.debug(PREFIX, STYLES.debug, ...args);
-        }
+        this.pushToHistory('DEBUG', ...args);
+        if (this.shouldLog(LogLevel.FULL)) console.debug(PREFIX, STYLES.debug, ...args);
     }
 }
 

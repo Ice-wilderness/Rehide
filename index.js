@@ -87,7 +87,7 @@ function setupSTPTInterceptor() {
     if (typeof eventSource !== 'undefined') {
         eventSource.on('prompt_template_prepare', (env) => {
             if (env && env.runType === 'generate') {
-                
+
                 // 周期管控：全新的生成回合重置拦截数组
                 if (env.runID !== undefined && env.runID !== stptLastRunID) {
                     stptInterceptedEntries = [];
@@ -109,7 +109,7 @@ function setupSTPTInterceptor() {
                 const interceptFunction = (funcName) => {
                     if (typeof env[funcName] === 'function' && !env[funcName]._isIntercepted) {
                         const originalFunc = env[funcName];
-                        
+
                         env[funcName] = async function(...args) {
                             const result = await originalFunc.apply(this, args);
 
@@ -138,7 +138,7 @@ function setupSTPTInterceptor() {
                                     try {
                                         // 传入书名获取该书所有条目（如果不传则获取当前环境生效的条目）
                                         const entries = await env.getWorldInfoData(bookName || undefined);
-                                        
+
                                         if (Array.isArray(entries)) {
                                             // 完美复刻 ST-PT 底层的查找逻辑：严格等于或正则匹配
                                             const matchedEntry = entries.find(e => {
@@ -713,9 +713,12 @@ function createPopup() {
                         <!-- 日志UI显示开关 -->
                         <div class="log-ui-toggle-container">
                             <label for="hide-helper-log-ui-toggle" class="log-ui-toggle-label">显示日志</label>
-                            <div class="hide-helper-checkbox-container">
-                                <input id="hide-helper-log-ui-toggle" type="checkbox">
-                                <label for="hide-helper-log-ui-toggle"></label>
+                            <div style="display: flex; align-items: center;">
+                                <i class="fa-solid fa-download" id="hide-helper-download-log" title="下载调试日志" style="cursor: pointer; margin-right: 12px; font-size: 16px; color: var(--hh-text-secondary); display: none; transition: color 0.2s;"></i>
+                                <div class="hide-helper-checkbox-container">
+                                    <input id="hide-helper-log-ui-toggle" type="checkbox">
+                                    <label for="hide-helper-log-ui-toggle"></label>
+                                </div>
                             </div>
                         </div>
 
@@ -1082,9 +1085,9 @@ async function runIncrementalHideCheck() {
         if (toHideIncrementally.length > 0) {
             Logger.info(`增量隐藏消息: 索引 [${toHideIncrementally.join(', ')}]`);
             Logger.debug('更新聊天数组数据...');
-            toHideIncrementally.forEach(idx => { 
+            toHideIncrementally.forEach(idx => {
                 if (chat[idx]) {
-                    chat[idx].is_system = true; 
+                    chat[idx].is_system = true;
                     chat[idx].hide_helper_hidden = true; // <-- 独家自定义标记
                 }
             });
@@ -1235,12 +1238,12 @@ async function unhideAllMessages(isFromInputZero = false) {
 
     if (context?.chat) {
         const chat = context.chat;
-        chat.forEach((msg, idx) => { 
-            if (msg.is_system === true && msg.hide_helper_hidden === true) { 
-                msg.is_system = false; 
+        chat.forEach((msg, idx) => {
+            if (msg.is_system === true && msg.hide_helper_hidden === true) {
+                msg.is_system = false;
                 delete msg.hide_helper_hidden;
                 $(`.mes[mesid="${idx}"]`).attr('is_system', 'false');
-            } 
+            }
         });
         Logger.debug('已取消所有消息的系统标记');
     }
@@ -1262,12 +1265,21 @@ async function unhideAllMessages(isFromInputZero = false) {
 
 // 更新 Token 统计 UI
 function updateTokenStatsUI() {
-    if (!promptManager || !promptManager.messages) return;
+    Logger.debug("【UI渲染触发】进入 updateTokenStatsUI，尝试重新计算各类 Tokens");
+    if (!promptManager) {
+        Logger.warn("【诊断失败】promptManager 为空");
+        return;
+    }
+    if (!promptManager.messages) {
+        Logger.warn("【诊断失败】promptManager.messages 为空");
+        return;
+    }
     const pm = promptManager;
 
     // 1. 计算各项 Token 数值
     const totalTokens = pm.tokenUsage || 0;
     let chatTokens = 0;
+    Logger.debug(`【诊断数据】提取到的当前总 Token (pm.tokenUsage) = ${totalTokens}`);
 
     const findCollectionById = (c, id) => {
         if (c.identifier === id) return c;
@@ -1282,11 +1294,28 @@ function updateTokenStatsUI() {
         return null;
     };
 
+    Logger.debug("【诊断流程】开始在 PromptManager 结构中寻找 identifier 为 'chatHistory' 的节点");
     const chatHistory = findCollectionById(pm.messages, 'chatHistory');
+
     if (chatHistory) {
-        chatHistory.getCollection().forEach(msg => {
+        const chatColl = chatHistory.getCollection();
+        Logger.debug(`【诊断成功】找到了 chatHistory，内部包含了 ${chatColl.length} 条数据`);
+        chatColl.forEach(msg => {
             if (msg.role === 'user' || msg.role === 'assistant') chatTokens += msg.getTokens();
         });
+        Logger.debug(`【诊断数据】成功计算出聊天 Tokens 累加值 = ${chatTokens}`);
+    } else {
+        // 最核心的 Bug 诊断点
+        Logger.error("【重大诊断警告】找不到 'chatHistory' 节点！酒馆 Prompt 构建器结构已发生改变。");
+        try {
+            let availableIdentifiers = [];
+            if (pm.messages && pm.messages.collection) {
+                availableIdentifiers = pm.messages.collection.map(c => c.identifier || '未命名节点');
+            }
+            Logger.error(`【结构转储】当前可用的顶层 identifiers 有: ${availableIdentifiers.join(', ')}`);
+        } catch(e) {
+            Logger.error("【结构转储】读取结构时发生意外错误: ", e);
+        }
     }
 
     const wiTokens = calculatedWiTokens;
@@ -1605,6 +1634,26 @@ function updateVersionDisplay(updateInfo) {
     }
 }
 
+// 日志UI自动关闭计时器 (60分钟熔断)
+let logUiAutoDisableTimer = null;
+
+// 环境信息抓取工具函数 (XPath)
+function logEnvironmentDetails() {
+    if (Logger.currentLevel !== 3) return; // 仅在级别3收集
+    const getXPathText = (xpath) => {
+        try {
+            const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+            return result.singleNodeValue ? result.singleNodeValue.textContent.trim() : "未找到";
+        } catch (e) { return "获取错误"; }
+    };
+    const stVersion = getXPathText('//*[@id="version_display"]');
+    const thVersion = getXPathText('//*[@id="tavern_helper"]/div/div[2]/div/div[1]/span');
+
+    Logger.debug(`【调试诊断】SillyTavern 版本: ${stVersion}`);
+    Logger.debug(`【调试诊断】Tavern Helper 版本: ${thVersion}`);
+    Logger.debug(`【调试诊断】Hide Helper 内部设置:`, extension_settings[extensionName]);
+}
+
 // 设置UI元素的事件监听器
 function setupEventListeners() {
     Logger.debug('设置事件监听器');
@@ -1616,10 +1665,20 @@ function setupEventListeners() {
 
     // 世界书扫描完成事件
     eventSource.on(event_types.WORLDINFO_SCAN_DONE, async (data) => {
-        if (!data || !data.activated || !data.activated.entries) return;
+        Logger.debug("【诊断事件】收到 WORLDINFO_SCAN_DONE 世界书信号");
+        if (!data) {
+            Logger.warn("【诊断警告】世界书扫描事件的 data 为空");
+            return;
+        }
+        if (!data.activated || !data.activated.entries) {
+            Logger.warn("【诊断警告】未能从 data 中找到 activated.entries 结构", data);
+            return;
+        }
+
         calculatedWiTokens = 0;
         wiDetailedStats = {};
         const entries = Array.from(data.activated.entries.values());
+        Logger.debug(`【诊断数据】成功提取到被激活的世界书条目数: ${entries.length}`);
 
         await Promise.all(entries.map(async (entry) => {
             const tokens = await getTokenCountAsync(entry.content);
@@ -1769,11 +1828,18 @@ function setupEventListeners() {
         $(window).off('resize.hideHelperMain').on('resize.hideHelperMain', () => centerPopup($popup));
 
         // 恢复日志UI开关状态
-        $('#hide-helper-log-ui-toggle').prop('checked', extension_settings[extensionName].logUiVisible || false);
-        if (extension_settings[extensionName].logUiVisible) {
+        const logUiVisible = extension_settings[extensionName].logUiVisible || false;
+        $('#hide-helper-log-ui-toggle').prop('checked', logUiVisible);
+        if (logUiVisible) {
             $('.log-level-selector-wrapper').slideDown(0);
+            if (extension_settings[extensionName].logLevel === 3) {
+                $('#hide-helper-download-log').show();
+            } else {
+                $('#hide-helper-download-log').hide();
+            }
         } else {
             $('.log-level-selector-wrapper').slideUp(0);
+            $('#hide-helper-download-log').hide();
         }
 
         // 显示主题提示弹窗（如果是首次打开）
@@ -1828,7 +1894,15 @@ function setupEventListeners() {
         applyLogLevel(newLevel);
         saveSettingsDebounced();
 
-        // 输出一条提示消息确认日志级别已更改
+        const $downloadBtn = $('#hide-helper-download-log');
+        if (newLevel === 3) {
+            $downloadBtn.fadeIn(200);
+            logEnvironmentDetails(); // 切换到3时立马收集一次环境
+        } else {
+            $downloadBtn.fadeOut(200);
+            Logger.logHistory = []; // 非3级别，立刻清空内存垃圾
+        }
+
         if (newLevel > 0) {
             console.log(`%c[隐藏助手]`, 'font-weight: bold; color: #28a745;', `日志级别已更改为: ${['零日志', '核心日志', '运行日志', '完整日志'][newLevel]}`);
         }
@@ -1858,17 +1932,53 @@ function setupEventListeners() {
         closeThemeNotification();
     });
 
-    // --- 日志UI显示开关事件 ---
+    // --- 日志UI显示开关事件 (带60分钟倒计时) ---
     $(document).on('change', '#hide-helper-log-ui-toggle', function() {
         const isVisible = $(this).is(':checked');
         extension_settings[extensionName].logUiVisible = isVisible;
         saveSettingsDebounced();
 
         const $logLevelWrapper = $('.log-level-selector-wrapper');
+        const $downloadBtn = $('#hide-helper-download-log');
+
         if (isVisible) {
             $logLevelWrapper.slideDown(200);
+            if (extension_settings[extensionName].logLevel === 3) {
+                $downloadBtn.fadeIn(200);
+                logEnvironmentDetails();
+            }
+
+            // 启动 60 分钟自动关闭熔断器
+            clearTimeout(logUiAutoDisableTimer);
+            logUiAutoDisableTimer = setTimeout(() => {
+                const $toggle = $('#hide-helper-log-ui-toggle');
+                if ($toggle.is(':checked')) {
+                    toastr.info('为保障性能，显示日志功能已达60分钟上限，已自动关闭并重置日志级别。');
+                    $toggle.prop('checked', false).trigger('change');
+                }
+            }, 60 * 60 * 1000); // 60分钟
+
         } else {
+            // UI 关闭时，连带清理所有设置，防止后台吃性能
             $logLevelWrapper.slideUp(200);
+            $downloadBtn.fadeOut(200);
+            clearTimeout(logUiAutoDisableTimer);
+
+            // 强制重置日志级别为 0 并清空内存
+            extension_settings[extensionName].logLevel = 0;
+            applyLogLevel(0);
+            saveSettingsDebounced();
+            Logger.logHistory = [];
+        }
+    });
+
+    // --- 日志下载按钮点击事件 ---
+    $(document).on('click', '#hide-helper-download-log', function() {
+        logEnvironmentDetails(); // 下载前强制再记录一次环境信息
+        if (Logger.exportLogs()) {
+            toastr.success('日志导出成功！');
+        } else {
+            toastr.warning('当前没有可导出的日志内容。');
         }
     });
 
