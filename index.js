@@ -1450,11 +1450,11 @@ function renderTokenStatsContent(totalTokens, chatTokens, wiTokens, otherTokens,
 
             let gradientBg = '';
             if (e.type === 'ejs') {
-                gradientBg = `background: linear-gradient(to right, var(--stats-bg-ejs) ${pct}%, transparent ${pct}%);`;
+                gradientBg = `background: linear-gradient(to right, var(--hh-stats-bg-ejs) ${pct}%, transparent ${pct}%);`;
             } else if (e.type === 'constant') {
-                gradientBg = `background: linear-gradient(to right, var(--stats-bg-constant) ${pct}%, transparent ${pct}%);`;
+                gradientBg = `background: linear-gradient(to right, var(--hh-stats-bg-constant) ${pct}%, transparent ${pct}%);`;
             } else {
-                gradientBg = `background: linear-gradient(to right, var(--stats-bg-dynamic) ${pct}%, transparent ${pct}%);`;
+                gradientBg = `background: linear-gradient(to right, var(--hh-stats-bg-dynamic) ${pct}%, transparent ${pct}%);`;
             }
 
             entriesContainer.insertAdjacentHTML('beforeend', `
