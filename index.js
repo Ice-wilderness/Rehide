@@ -493,15 +493,33 @@ function centerPopup($popup) {
 
     // 先清掉上一次「夹紧」可能写下的内联 max-width/max-height，再量真实尺寸
     $popup.css({ maxWidth: '', maxHeight: '' });
-    let popupWidth = $popup.outerWidth();
+
+    // 第四十二轮（用户反馈：移动端点输入框弹键盘时「弹窗右半部分跑到屏幕外」）：
+    //   宽度**不能**在这一帧里量。键盘弹出/收起的一两帧里浏览器正在重建 layout viewport，
+    //   `width: 90%` 会被解析到临时缩水的包含块上（实测 outerWidth() 只报 51.4px），
+    //   再按它算 left 就会把弹窗右半截推出屏幕，而且键盘收起后也未必自动修回来。
+    //   所以宽度改由 CSS 意图直接算：min(视口宽 × 90%, 计算后的 max-width)，
+    //   与 `.hide-helper-popup { width:90%; max-width:420px }` 等价，不依赖任何瞬态测量值。
+    //   只认 px 单位的 max-width；主题把它改成百分比/none 时回退到纯 90%。
+    const computedStyle = window.getComputedStyle($popup[0]);
+    const cssMaxWidthText = (computedStyle.maxWidth || '').trim();
+    const cssMaxWidth = /px$/i.test(cssMaxWidthText) ? parseFloat(cssMaxWidthText) : NaN;
+    const intendedWidth = Math.min(
+        windowWidth * 0.9,
+        Number.isFinite(cssMaxWidth) && cssMaxWidth > 0 ? cssMaxWidth : windowWidth
+    );
+    let popupWidth = intendedWidth;
+    // 内联写死宽度：既保证居中用的是真实目标宽度，也避免键盘动画期间弹窗先缩成窄条再弹开
+    $popup.css({ width: intendedWidth + 'px', boxSizing: 'border-box' });
     let popupHeight = $popup.outerHeight();
 
     // 弹窗比可视区域还宽/高时，先把尺寸夹到可视区域内，再算居中坐标
     const maxAllowedWidth = Math.max(160, windowWidth - 20);
     const maxAllowedHeight = Math.max(160, windowHeight - 20);
     if (popupWidth > maxAllowedWidth) {
-        $popup.css('max-width', maxAllowedWidth + 'px');
-        popupWidth = $popup.outerWidth();
+        // 同样直接写计算值，不再回读 outerWidth()（瞬态帧里回读仍可能是错的）
+        popupWidth = maxAllowedWidth;
+        $popup.css('width', maxAllowedWidth + 'px');
     }
     if (popupHeight > maxAllowedHeight) {
         $popup.css('max-height', maxAllowedHeight + 'px');
@@ -8784,6 +8802,9 @@ function setupEventListeners() {
 
     // --- 弹窗和标签页交互 ---
 
+    // 主弹窗重排的补帧句柄：键盘动画期间视口会连改几帧，事件回调可能落在中间态
+    let mainPopupSettleRaf = 0;
+
     $('#hide-helper-wand-button').on('click', function() {
         Logger.debug('魔杖按钮被点击');
         if (!extension_settings[extensionName]?.enabled) {
@@ -8832,11 +8853,27 @@ function setupEventListeners() {
         requestAnimationFrame(() => updateTabIndicator()); // 布局稳定后再校正一次
         // 第四十一轮：除了窗口 resize / 转屏，还要跟 visualViewport —— 移动端软键盘弹出、
         //   页面缩放都会只改 visualViewport 尺寸而不触发 window.resize，不跟就会重新跑偏。
-        const relayoutMainPopup = () => { centerPopup($popup); updateTabIndicator(); repositionChildPopups(); };
+        // 第四十二轮：键盘弹出/收起时视口会连续变好几帧，resize 回调可能正好落在中间态，
+        //   所以每次重排后再补一帧落位，保证最终坐标是对的（宽度已由 centerPopup 按 CSS 意图算，不再依赖测量）。
+        const relayoutMainPopup = () => {
+            centerPopup($popup);
+            updateTabIndicator();
+            repositionChildPopups();
+            if (mainPopupSettleRaf) cancelAnimationFrame(mainPopupSettleRaf);
+            mainPopupSettleRaf = requestAnimationFrame(() => {
+                mainPopupSettleRaf = 0;
+                centerPopup($popup);
+                updateTabIndicator();
+                repositionChildPopups();
+            });
+        };
         $(window).off('resize.hideHelperMain orientationchange.hideHelperMain')
             .on('resize.hideHelperMain orientationchange.hideHelperMain', relayoutMainPopup);
         if (window.visualViewport) {
-            $(window.visualViewport).off('resize.hideHelperMain').on('resize.hideHelperMain', () => { centerPopup($popup); updateTabIndicator(); });
+            // resize：键盘/缩放改变可见视口；scroll：键盘弹出后部分浏览器只是平移可见窗口
+            $(window.visualViewport)
+                .off('resize.hideHelperMain scroll.hideHelperMain')
+                .on('resize.hideHelperMain scroll.hideHelperMain', relayoutMainPopup);
         }
 
         // 恢复日志UI开关状态
@@ -8920,9 +8957,14 @@ function setupEventListeners() {
         $('#hide-helper-backdrop').hide();
         closeEntryPopup(); // 条目详情子弹窗随主弹窗一并关闭
         closeChildStack(); // 主弹窗关闭 = **重置**：整轮层级结束
+        // 取消尚未执行的「补帧落位」，避免回调打到已关闭的弹窗上
+        if (mainPopupSettleRaf) {
+            cancelAnimationFrame(mainPopupSettleRaf);
+            mainPopupSettleRaf = 0;
+        }
         $(window).off('resize.hideHelperMain orientationchange.hideHelperMain');
         if (window.visualViewport) {
-            $(window.visualViewport).off('resize.hideHelperMain');
+            $(window.visualViewport).off('resize.hideHelperMain scroll.hideHelperMain');
         }
 
         Logger.debug(`【关闭弹窗】✅ 弹窗已关闭`);
