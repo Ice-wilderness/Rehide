@@ -5,7 +5,6 @@ import { getRequestHeaders } from '../../../../script.js';
 // 远程仓库配置 - 需要根据实际仓库地址修改
 const REPO_ROOT = "https://raw.githubusercontent.com/Ice-wilderness/Rehide/main";
 const MANIFEST_URL = `${REPO_ROOT}/manifest.json`;
-const CHANGELOG_URL = `${REPO_ROOT}/CHANGELOG.md`;
 
 const extensionName = "hide";
 const KEY_LAST_CHECK = `${extensionName}_last_update_check`;
@@ -164,19 +163,6 @@ export async function checkForUpdates(force = false) {
     }
 
     return result;
-}
-
-/**
- * 获取更新日志
- */
-export async function getChangelog() {
-    try {
-        const response = await fetch(CHANGELOG_URL + `?t=${Date.now()}`);
-        return await response.text();
-    } catch (e) {
-        Logger.error('获取更新日志失败:', e);
-        return "无法获取更新日志。";
-    }
 }
 
 /**

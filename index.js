@@ -11,7 +11,7 @@ import { promptManager } from "../../../openai.js";
 import { loadWorldInfo } from "../../../world-info.js";
 // 第三十一轮：`callGenericPopup` / `POPUP_TYPE` 已不再使用（「模拟发送」弹窗改为插件自绘，
 //   见 askSimulateContent）—— 保留 import 会是个永远不用的死引用，故移除。
-import { checkForUpdates, getChangelog, performUpdate, initUpdateCheck } from "./update.js";
+import { checkForUpdates, performUpdate, initUpdateCheck } from "./update.js";
 
 const extensionName = "hide";
 const defaultSettings = {
@@ -50,11 +50,22 @@ const defaultSettings = {
     tab_visible: { hide: true, limiter: true, stats: true },
     stats_enabled: true,
     // --- 主题设置 ---
-    theme: 'light',
+    theme: 'light', // 'light' | 'dark' | 'galgame'（默认白天）
+    // --- 背景图片设置（所有主题通用）---
+    background_mode: 'character', // 'none' | 'character' | 'custom'（默认当前角色卡）
+    background_custom_url: '',
+    // --- 上下文预算提醒 ---
+    budget_warning_enabled: false,
+    budget_tokens: 400000,
     // --- 日志级别设置 ---
     logLevel: 0, // 0=零日志(默认), 1=核心日志, 2=运行日志, 3=完整日志
     // --- 主题提示设置 ---
-    theme_notification_viewed: false, // 是否已显示过主题切换提示
+    theme_notification_viewed_v2: false, // 新版主题/背景提示是否已显示过
+    // --- 悬浮球 ---
+    floating_ball: false, // 是否处于悬浮球模式（持久化：刷新后直接显示悬浮球）
+    fab_top: null, // 悬浮球中心 y 坐标（px，视口坐标）；null = 自动垂直居中（照搬 Context-Using）
+    floating_ball_intro_viewed: false, // 首次点击「-」的说明弹窗是否已看过
+    floating_ball_exit_intro_viewed: false, // 首次从悬浮球状态退出的说明弹窗是否已看过
     // --- 日志UI显示设置 ---
     logUiVisible: false, // 控制日志级别选择器的显示/隐藏，默认隐藏
     logUiOpenedAt: null, // 记录日志UI开启时的时间戳，用于60分钟熔断
@@ -78,8 +89,15 @@ let cachedContext = null;
 // 因此锚定会镜像写入 message.swipe_info[*].extra，切到任意版本都能读到（详见 writeAnchoredStats）。
 const STATS_EXTRA_KEY = 'hideHelperStats';
 const STATS_ANCHOR_KEEP = 2;
-// 预算预警阈值：总上下文 tokens ≥ 该值时，「总共」框标红提示（用户口径 200000）。
-const STATS_BUDGET_TOKENS = 200000;
+// 预算预警阈值：总上下文 tokens ≥ 该值时，「总共」框标红提示。
+// 默认 400000，可在「隐藏楼层」页的「上下文预算提醒」里调整；提醒开关另控是否弹窗。
+// 上下文预算阈值（tokens）：用户可在「隐藏楼层」页调整，默认 400000。
+// 统计页「总共」的超出预算标红与「上下文预算提醒」弹窗共用这个值。
+const STATS_BUDGET_TOKENS_DEFAULT = 400000;
+function getBudgetTokens() {
+    const n = Number(extension_settings[extensionName]?.budget_tokens);
+    return Number.isFinite(n) && n > 0 ? Math.round(n) : STATS_BUDGET_TOKENS_DEFAULT;
+}
 // 参与锚定的生成类型（用户实际发起的发送；quiet 等后台生成如总结请求不参与）
 const ANCHORED_GEN_TYPES = new Set(['normal', 'continue', 'swipe', 'regenerate', 'impersonate']);
 // 标记聊天切换的时刻，异步统计以此判废（避免切聊天后旧数据写入新聊天）。
@@ -113,10 +131,12 @@ let statsRunOwner = null;    // 当前执行者的令牌；null = 空闲
 const statsJobQueue = [];    // 待执行任务 [{ run, onError, label }]，FIFO
 
 // 把一次统计任务加入队列；空闲时立即调度执行，忙碌时排队等待（有告警，不再静默丢弃）。
+// job.onSettled（可选）：任务结束回调 —— 正常完成、抛错、排队超限被丢弃都会调用一次。
 function enqueueStatsJob(job) {
     while (statsJobQueue.length >= STATS_QUEUE_MAX) {
         const dropped = statsJobQueue.shift();
         Logger.warn(`【统计】排队已满（上限 ${STATS_QUEUE_MAX}），丢弃最早的一次统计任务（${dropped?.label || '未命名'}）`);
+        try { dropped?.onSettled?.(); } catch (e) { Logger.warn('【统计】任务结算回调失败:', e); }
     }
     statsJobQueue.push(job);
     if (statsRunOwner) {
@@ -140,6 +160,7 @@ function drainStatsQueue() {
             try { job.onError?.(err); } catch (e) { Logger.warn('【统计】任务错误处理失败:', e); }
         } finally {
             if (statsRunOwner === owner) statsRunOwner = null;   // 只释放自己持有的锁
+            try { job.onSettled?.(); } catch (e) { Logger.warn('【统计】任务结算回调失败:', e); }
             drainStatsQueue();                                    // 串行：继续下一个任务
         }
     }, 0);
@@ -151,6 +172,8 @@ function drainStatsQueue() {
 let statsPinnedIndex = null;
 let statsViewMode = 'detail';
 let statsBaselineIndex = null;
+// 「明细 / 对比」切换的滑块动画：记录切换前的指示条位置，渲染后从旧位置滑到新位置。
+let pendingViewToggleSlide = null;
 // 明细「已激活条目」列表的排序/过滤状态
 //   statsListSortMode   'default'（当前顺序）| 'context'（实际上下文先后顺序）
 //   statsListTypeFilter 'all' | 'ejs' | 'dynamic' | 'constant'
@@ -176,84 +199,178 @@ let simulateAnchor = null;      // { total, chat, wi, other, at, genType, wiDeta
 let simulateInProgress = false; // 模拟进行中标志：SETTINGS_READY 据此把统计转入临时锚定并 abort 请求
 let simulateContent = '';       // 本次模拟发送的自定义内容（供 UI 提示）
 let simulateChatId = null;      // 本次模拟发起时的聊天 id；统计落盘前用它核对，防止把 A 聊天的组装结果写进 B 聊天
+// 模拟统计的结算信号：生成管线只是前半程，token 统计在 SETTINGS_READY 里入队异步执行，
+// 进度弹窗必须等统计真正算完（锚定写入 + 统计页刷新）再收起，否则用户会看到"弹窗关了但数字还是旧的"。
+// 每次 runSimulateSend 开跑前新建一份，SETTINGS_READY 入队时把它交给统计任务的 onSettled
+// （成功 / 失败 / 排队超限被丢弃都会 resolve 一次）；finally 在 resolve 之后才关进度弹窗。
+let simulateStatsWait = null;   // { promise, resolve, queued, settled } | null
 // 模拟锚定在"统一锚点列表"里的哨兵 id：真实锚点用消息下标（非负整数），二者不会冲突。
 // 模拟锚定始终排在列表最右（最新），从而能在 chips / 对比基准里像普通锚点一样被浏览与比对。
 const SIM_ANCHOR_ID = 'sim';
 
-// --- 聊天统计：完整上下文快照（内存 + localStorage 持久副本）---
+// --- 聊天统计：完整上下文快照（内存 + IndexedDB 持久副本）---
 // 每次统计（真实发送 / 模拟发送）会把**实际发送的每条消息**（角色/tokens/来源槽位/正文）存进来，
-// 供统计页的「完整上下文」查看器逐条查看与分析。**不写入聊天文件**（聊天文件不会因为它膨胀）。
-// ⚠️ 第二十六轮新增**浏览器 localStorage 持久副本**（用户口径：「每次查看效果都要重新生成一遍消息，
-//    开发测试阶段非常麻烦」）—— 刷新页面 / 切聊天回来都还在：改完 `style.css` 刷新页面即可直接复看，
-//    不用再重发消息。上限 CONTEXT_DUMP_LS_MAX_BYTES，超了从最旧的开始丢；配额写爆则本次会话退化成纯内存。
-// 内存里保留最近 CONTEXT_DUMP_KEEP 份（真实锚点按锚定到的消息下标、模拟锚定用 SIM_ANCHOR_ID 作键）。
+// 供统计页的「完整上下文」查看器与条目详情（实际发送正文）读取。**不写入聊天文件**（聊天文件不会因为它膨胀）。
+// 持久层用 IndexedDB（不是 localStorage）：快照存的是整段提示词原文，单份就可能上 MB，
+// localStorage 的 4MB 总配额 + 整包 JSON.stringify 会频繁淘汰、还会阻塞主线程；
+// IndexedDB 配额大、结构化存储、异步写入，失败时自动退化为"仅内存"，不影响统计本身。
+// 内存里保留最近 CONTEXT_DUMP_KEEP 份（真实锚点按锚定到的消息下标、模拟锚定用 SIM_ANCHOR_ID 作键），
+// IndexedDB 与之保持一致（新增写入、淘汰同步删除）。
 const CONTEXT_DUMP_KEEP = 3;
-const CONTEXT_DUMP_LS_KEY = 'hide-helper.contextDumps.v1';
-const CONTEXT_DUMP_LS_MAX_BYTES = 4 * 1024 * 1024;
-let contextDumpPersistOff = false;   // 配额写爆过一次就不再尝试（本会话内）
-const contextDumpStore = new Map(); // key = `${chatId}|${anchorId}` -> { chatId, anchorId, source, genType, at, total, messages }
+const CONTEXT_DUMP_DB_NAME = 'hide-helper-context-dumps';
+const CONTEXT_DUMP_DB_VERSION = 1;
+const CONTEXT_DUMP_STORE = 'dumps';
+// 旧版 localStorage 键：不再读取（用户口径：不做旧数据迁移），仅在 IndexedDB 可用后一次性清理释放配额。
+const CONTEXT_DUMP_LEGACY_LS_KEY = 'hide-helper.contextDumps.v1';
+let contextDumpDbPromise = null;      // Promise<IDBDatabase|null>；null = 本环境不支持（隐私模式等）
+let contextDumpPersistOff = false;    // 写入失败一次后本次会话退化为纯内存
+let contextDumpHydration = null;      // Promise<number>：启动时从 IndexedDB 恢复的进行中任务
+const contextDumpStore = new Map(); // key = `${chatId}|${anchorId}` -> { key, chatId, anchorId, source, genType, at, total, messages }
 // 最近一次 computeRenderedStats 产出的原始快照；由调用方（写锚定 / 模拟锚定）消费后连同键一起入库。
 let lastContextDump = null;
 
 function contextDumpKey(chatId, anchorId) { return `${chatId}|${anchorId}`; }
 
-// localStorage 句柄（隐私模式 / 没有 window 时返回 null；离线单测的 shim 里也没有它）
-function contextDumpStorage() {
-    try {
-        return (typeof localStorage !== 'undefined' && localStorage) ? localStorage : null;
-    } catch (e) { return null; }
+// 打开（首次会自动建库）。失败/不支持时返回 null，调用方按"仅内存"处理。
+function openContextDumpDb() {
+    if (contextDumpDbPromise) return contextDumpDbPromise;
+    contextDumpDbPromise = new Promise((resolve) => {
+        let settled = false;
+        const done = (db) => { if (!settled) { settled = true; resolve(db); } };
+        try {
+            if (typeof indexedDB === 'undefined' || !indexedDB) { done(null); return; }
+            const req = indexedDB.open(CONTEXT_DUMP_DB_NAME, CONTEXT_DUMP_DB_VERSION);
+            req.onupgradeneeded = () => {
+                const db = req.result;
+                if (!db.objectStoreNames.contains(CONTEXT_DUMP_STORE)) {
+                    db.createObjectStore(CONTEXT_DUMP_STORE, { keyPath: 'key' });
+                }
+            };
+            req.onsuccess = () => {
+                const db = req.result;
+                // 其它标签页升级版本时主动让路，避免长期占着旧连接
+                db.onversionchange = () => { try { db.close(); } catch (e) { /* 忽略 */ } };
+                done(db);
+                // 申请"持久化存储"：降低浏览器在磁盘紧张时清理本库的概率（不保证成功）
+                try { navigator.storage?.persist?.().catch(() => {}); } catch (e) { /* 忽略 */ }
+            };
+            req.onerror = () => {
+                Logger.warn('【完整上下文】IndexedDB 打开失败，本次会话只保留内存副本:', req.error?.message || req.error);
+                done(null);
+            };
+            // 另一个标签页正卡着升级：不让启动流程无限等待，直接退化为内存
+            req.onblocked = () => {
+                Logger.warn('【完整上下文】IndexedDB 升级被其它标签页阻塞，本次会话只保留内存副本');
+                done(null);
+            };
+        } catch (e) {
+            Logger.warn('【完整上下文】IndexedDB 不可用，本次会话只保留内存副本:', e?.message || e);
+            done(null);
+        }
+    });
+    return contextDumpDbPromise;
 }
 
-function persistContextDumps() {
+function idbPutDump(rec) {
+    return openContextDumpDb().then((db) => new Promise((resolve) => {
+        if (!db) { resolve(false); return; }
+        try {
+            const tx = db.transaction(CONTEXT_DUMP_STORE, 'readwrite');
+            tx.objectStore(CONTEXT_DUMP_STORE).put(rec);
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);
+            tx.onabort = () => resolve(false);
+        } catch (e) { resolve(false); }
+    }));
+}
+
+function idbDeleteDump(key) {
+    return openContextDumpDb().then((db) => new Promise((resolve) => {
+        if (!db) { resolve(false); return; }
+        try {
+            const tx = db.transaction(CONTEXT_DUMP_STORE, 'readwrite');
+            tx.objectStore(CONTEXT_DUMP_STORE).delete(key);
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);
+            tx.onabort = () => resolve(false);
+        } catch (e) { resolve(false); }
+    }));
+}
+
+function idbReadAllDumps() {
+    return openContextDumpDb().then((db) => new Promise((resolve) => {
+        if (!db) { resolve([]); return; }
+        try {
+            const tx = db.transaction(CONTEXT_DUMP_STORE, 'readonly');
+            const req = tx.objectStore(CONTEXT_DUMP_STORE).getAll();
+            req.onsuccess = () => resolve(Array.isArray(req.result) ? req.result : []);
+            req.onerror = () => resolve([]);
+        } catch (e) { resolve([]); }
+    }));
+}
+
+function idbClearDumps() {
+    return openContextDumpDb().then((db) => new Promise((resolve) => {
+        if (!db) { resolve(false); return; }
+        try {
+            const tx = db.transaction(CONTEXT_DUMP_STORE, 'readwrite');
+            tx.objectStore(CONTEXT_DUMP_STORE).clear();
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);
+            tx.onabort = () => resolve(false);
+        } catch (e) { resolve(false); }
+    }));
+}
+
+function persistContextDump(rec) {
     if (contextDumpPersistOff) return;
-    const ls = contextDumpStorage();
-    if (!ls) return;
-    try {
-        let entries = Array.from(contextDumpStore.values());
-        for (let i = 0; i < 4; i++) {
-            const payload = JSON.stringify({ v: 1, at: Date.now(), dumps: entries });
-            if (payload.length <= CONTEXT_DUMP_LS_MAX_BYTES || entries.length <= 1) {
-                ls.setItem(CONTEXT_DUMP_LS_KEY, payload);
-                return;
-            }
-            entries = entries.slice(1);   // 太大 → 先丢掉最旧的那份再试
-        }
-    } catch (e) {
+    void idbPutDump(rec).then((ok) => {
+        if (ok || contextDumpPersistOff) return;
         contextDumpPersistOff = true;
-        Logger.warn('【完整上下文】快照持久化失败（配额或隐私模式），本次会话只保留内存副本:', e?.message || e);
-    }
+        Logger.warn('【完整上下文】IndexedDB 写入失败（配额或隐私模式），本次会话只保留内存副本');
+    });
 }
 
-// 插件初始化时恢复持久副本（见 initializeExtension 的 1.5 步）
+// 插件初始化时恢复持久副本（见 initializeExtension 的 1.5 步）。
+// 异步执行：先合并进内存（内存里已有的更新，优先保留），再按"最近 N 份"裁剪并同步删除库里的旧记录。
 function loadPersistedContextDumps() {
-    const ls = contextDumpStorage();
-    if (!ls) return 0;
-    try {
-        const raw = ls.getItem(CONTEXT_DUMP_LS_KEY);
-        if (!raw) return 0;
-        const data = JSON.parse(raw);
-        for (const d of (Array.isArray(data?.dumps) ? data.dumps : [])) {
-            if (!d || !d.chatId || d.anchorId === undefined || d.anchorId === null) continue;
-            contextDumpStore.set(contextDumpKey(d.chatId, d.anchorId), d);
-        }
-        if (contextDumpStore.size) Logger.debug(`【完整上下文】已从 localStorage 恢复 ${contextDumpStore.size} 份快照`);
+    if (contextDumpHydration) return contextDumpHydration;
+    contextDumpHydration = (async () => {
+        const db = await openContextDumpDb();
+        if (!db) return 0;
+        // IndexedDB 可用 → 旧 localStorage 副本已无意义，一次性清掉释放配额（旧数据按用户口径不迁移）
+        try { localStorage.removeItem(CONTEXT_DUMP_LEGACY_LS_KEY); } catch (e) { /* 忽略 */ }
+        const all = (await idbReadAllDumps())
+            .filter(d => d && d.key && d.chatId && d.anchorId !== undefined && d.anchorId !== null);
+        if (!all.length) return 0;
+        const merged = new Map(all.map(d => [d.key, d]));
+        for (const [k, v] of contextDumpStore) merged.set(k, v);   // 本次会话里新写入的更新，覆盖库里的旧副本
+        const sorted = [...merged.values()].sort((a, b) => (a.at || 0) - (b.at || 0));
+        contextDumpStore.clear();
+        for (const rec of sorted.slice(-CONTEXT_DUMP_KEEP)) contextDumpStore.set(rec.key, rec);
+        // 内存只留 N 份 → 库里多出来的同步删掉，两边始终一致
+        const keep = new Set(contextDumpStore.keys());
+        for (const d of all) if (!keep.has(d.key)) void idbDeleteDump(d.key);
+        Logger.debug(`【完整上下文】已从 IndexedDB 恢复 ${contextDumpStore.size} 份快照`);
+        // 恢复后刷新锚定栏入口（快照可用性决定 #tub-open-outline 是否置灰）
+        try { if (document.getElementById('token-stats-panel')) updateTokenStatsUI(); } catch (e) { /* 忽略 */ }
         return contextDumpStore.size;
-    } catch (e) {
-        Logger.warn('【完整上下文】快照恢复失败:', e?.message || e);
-        return 0;
-    }
+    })();
+    return contextDumpHydration;
 }
 
 function saveContextDump(chatId, anchorId, source, dump) {
     if (!chatId || !dump) return;
     const key = contextDumpKey(chatId, anchorId);
     if (contextDumpStore.has(key)) contextDumpStore.delete(key); // 先删再插 → 刷新 LRU 顺序
-    contextDumpStore.set(key, { ...dump, chatId, anchorId, source, at: Date.now() });
+    const rec = { ...dump, key, chatId, anchorId, source, at: Date.now() };
+    contextDumpStore.set(key, rec);
     while (contextDumpStore.size > CONTEXT_DUMP_KEEP) {
-        const oldest = contextDumpStore.keys().next().value;
-        contextDumpStore.delete(oldest);
+        const oldestKey = contextDumpStore.keys().next().value;
+        contextDumpStore.delete(oldestKey);
+        void idbDeleteDump(oldestKey);   // 内存淘汰 → 库同步删，两边一致
     }
-    persistContextDumps();   // 持久副本：刷新页面 / 切聊天回来仍可查看
+    persistContextDump(rec);   // 持久副本：刷新页面 / 切聊天回来仍可查看
 }
 
 // --- 聊天统计：锚定落点（"生成的那条消息"）---
@@ -288,31 +405,351 @@ const domCache = {
 };
 
 // --- 主题应用逻辑 ---
+// 三套主题：light（默认亮色）/ dark（暗色）/ galgame（暖纸 + 珊瑚橙的 Galgame 风格）。
+// light 不写属性（走 :root 的亮色变量），其余写 `data-theme="<name>"`。
+// 动态创建的子窗 / 浮层 / 遮罩统一用 applyThemeAttr()，避免每处各写一份 `theme === 'dark'` 判定。
+const HH_THEMES = ['light', 'dark', 'galgame'];
+// 白天图标照搬 Context-Using 的 #cu-theme-toggle（内联 SVG 太阳）
+const HH_ICON_SUN = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg>';
+// 按钮显示“当前主题”，点击仍按 light → dark → galgame 循环切换。
+const HH_THEME_TOGGLE_META = {
+    light: { icon: 'fa-light fa-sun-bright', iconHtml: HH_ICON_SUN, text: '白天' },
+    dark: { icon: 'fa-solid fa-moon', text: '黑夜' },
+    galgame: { icon: 'fa-solid fa-palette', text: '日系' },
+};
+function currentTheme() {
+    const t = extension_settings[extensionName]?.theme || 'light';
+    return HH_THEMES.includes(t) ? t : 'light';
+}
+function applyThemeAttr(el) {
+    if (!el) return;
+    const theme = currentTheme();
+    if (theme === 'light') el.removeAttribute('data-theme');
+    else el.setAttribute('data-theme', theme);
+}
+function themeToggleHtml(theme) {
+    const meta = HH_THEME_TOGGLE_META[theme] || HH_THEME_TOGGLE_META.light;
+    const icon = meta.iconHtml || `<i class="${meta.icon}"></i>`;
+    return `${icon} ${meta.text}`;
+}
 function applyTheme(theme) {
-    // 同时寻找主弹窗、条目详情子窗、聊天统计子弹窗、完整上下文查看器、更新遮罩层、通知弹窗，赋予独立的局部主题标识
-    const targets = $('#hide-helper-popup, #hide-helper-entry-popup, #hide-helper-chat-stats-popup, #hide-helper-wi-msg-popup, #hide-helper-ctx-outline-popup, #hide-helper-ctx-merged-popup, .hide-modal-overlay, #hide-helper-theme-notification');
-    if (theme === 'dark') {
-        targets.attr('data-theme', 'dark');
-        $('#hide-helper-theme-toggle').html('<i class="fa-solid fa-sun"></i> 切换为亮色模式');
-    } else {
-        targets.removeAttr('data-theme');
-        $('#hide-helper-theme-toggle').html('<i class="fa-solid fa-moon"></i> 切换为暗色模式');
+    const normalized = HH_THEMES.includes(theme) ? theme : 'light';
+    // 同时寻找主弹窗、条目详情子窗、聊天统计子弹窗、完整上下文查看器、更新遮罩层、通知弹窗、悬浮球，赋予独立的局部主题标识
+    const targets = $('#hide-helper-popup, #hide-helper-entry-popup, #hide-helper-chat-stats-popup, #hide-helper-wi-msg-popup, #hide-helper-ctx-outline-popup, #hide-helper-ctx-merged-popup, .hide-modal-overlay, .hide-helper-notification-popup, #hide-helper-theme-notification, #hide-helper-floating-ball, #hide-helper-ball-intro');
+    if (normalized === 'light') targets.removeAttr('data-theme');
+    else targets.attr('data-theme', normalized);
+    $('#hide-helper-theme-toggle, #hide-helper-notification-theme-toggle').html(themeToggleHtml(normalized));
+}
+
+// --- 悬浮球（样式与纵向拖动逻辑照搬 Context-Using） ---
+// 记录本次会话里悬浮球是否真正显示过：仅用于判断「首次退出悬浮球」提示，
+// 避免“首次点 - 弹出说明但尚未缩球”时点 X 被误判为退出悬浮球。
+const FAB_ID = 'hide-helper-floating-ball';
+let floatingBallShown = false;
+
+// 部分酒馆主题会把 body 设为 position:fixed（页面滚动改由 document 承担），
+// 此时 fixed 子元素会被 window.scrollY 整体上移，坐标不再是纯视口坐标。
+// 用一个 1×1 的 fixed 探针直接测出这个偏移：正常页面为 0，body:fixed 主题为 scrollY。
+let fixedCoordProbe = null;
+function getFixedViewportOffsetY() {
+    try {
+        if (!fixedCoordProbe || !fixedCoordProbe.isConnected) {
+            fixedCoordProbe = document.createElement('div');
+            fixedCoordProbe.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none;';
+            document.documentElement.appendChild(fixedCoordProbe);
+        }
+        const top = fixedCoordProbe.getBoundingClientRect().top;
+        return Number.isFinite(top) ? -top : 0;
+    } catch (e) { return 0; }
+}
+
+function isFloatingBallEnabled() {
+    return !!extension_settings[extensionName]?.floating_ball;
+}
+function fabViewportHeight() {
+    const vv = window.visualViewport;
+    const h = Math.min(
+        window.innerHeight || Infinity,
+        document.documentElement.clientHeight || Infinity,
+        (vv && vv.height) || Infinity
+    );
+    // 内嵌浏览器不可见时可能三项都是 0：给一个兜底高度，等可见后的 resize 事件会重新校正
+    return Number.isFinite(h) && h > 0 ? h : 600;
+}
+function clampFabCenter(center) {
+    const fab = document.getElementById(FAB_ID);
+    const size = fab?.offsetHeight || 40;
+    const min = 10 + size / 2;
+    const max = Math.max(min, fabViewportHeight() - 10 - size / 2);
+    const n = Number(center);
+    return Math.min(max, Math.max(min, Number.isFinite(n) ? n : min));
+}
+// 右侧可拖动悬浮球：有保存的位置就用保存值，否则垂直居中；每次视口变化都重新夹紧。
+// fab_top 保存的是"悬浮球中心的视口 y 坐标"；写入 DOM 时补上 fixed 探针测出的滚动偏移。
+function positionFloatingBall() {
+    if (fabDrag) return;   // 拖动中不要被 resize/scroll 回调抢位置
+    const fab = document.getElementById(FAB_ID);
+    if (!fab) return;
+    const saved = extension_settings[extensionName]?.fab_top;
+    const hasSaved = saved !== null && saved !== undefined && saved !== '' && Number.isFinite(Number(saved));
+    const center = hasSaved ? Number(saved) : fabViewportHeight() / 2;
+    fab.style.top = `${Math.round(clampFabCenter(center) + getFixedViewportOffsetY())}px`;
+    fab.style.right = '0px';
+    fab.style.left = 'auto';
+}
+let fabPositionBound = false;
+function bindFabPositionListeners() {
+    if (fabPositionBound) return;
+    fabPositionBound = true;
+    $(window).off('resize.hideHelperFab orientationchange.hideHelperFab').on('resize.hideHelperFab orientationchange.hideHelperFab', positionFloatingBall);
+    if (window.visualViewport) {
+        $(window.visualViewport)
+            .off('resize.hideHelperFab scroll.hideHelperFab')
+            .on('resize.hideHelperFab scroll.hideHelperFab', positionFloatingBall);
     }
 }
 
+// 垂直拖动：只改 top，横向始终贴右；松手后写入设置，下次打开/刷新沿用。
+let fabDrag = null;
+let fabClickSuppressUntil = 0;
+function bindFabDrag() {
+    const fab = document.getElementById(FAB_ID);
+    if (!fab || fab.dataset.dragBound === '1') return;
+    fab.dataset.dragBound = '1';
+    fab.addEventListener('pointerdown', (e) => {
+        if (e.button !== undefined && e.button !== 0) return;
+        fabDrag = {
+            pointerId: e.pointerId,
+            startX: e.clientX,
+            startY: e.clientY,
+            startCenter: fab.getBoundingClientRect().top + fab.getBoundingClientRect().height / 2,
+            moved: false,
+        };
+        fab.classList.add('is-dragging');
+        try { fab.setPointerCapture(e.pointerId); } catch (err) { /* 忽略 */ }
+        e.preventDefault();
+    });
+    fab.addEventListener('pointermove', (e) => {
+        if (!fabDrag || e.pointerId !== fabDrag.pointerId) return;
+        const dx = e.clientX - fabDrag.startX;
+        const dy = e.clientY - fabDrag.startY;
+        // 只允许纵向移动，但横向拖动也算“拖动过”：松手后不应误触展开弹窗
+        if (!fabDrag.moved && Math.hypot(dx, dy) <= 2) return;
+        fabDrag.moved = true;
+        fab.style.top = `${Math.round(clampFabCenter(fabDrag.startCenter + dy) + getFixedViewportOffsetY())}px`;
+        e.preventDefault();
+    });
+    const finishDrag = (e) => {
+        if (!fabDrag || (e && e.pointerId !== fabDrag.pointerId)) return;
+        const moved = fabDrag.moved;
+        const rect = fab.getBoundingClientRect();
+        const center = clampFabCenter(rect.top + rect.height / 2);
+        fabDrag = null;
+        fab.classList.remove('is-dragging');
+        try { if (e) fab.releasePointerCapture?.(e.pointerId); } catch (err) { /* 忽略 */ }
+        if (moved) {
+            extension_settings[extensionName].fab_top = Math.round(center);
+            saveSettingsDebounced();
+            // 拖完松手会补发一次 click：短暂拦截，避免“拖完就展开弹窗”。
+            fabClickSuppressUntil = Date.now() + 400;
+        }
+    };
+    fab.addEventListener('pointerup', finishDrag);
+    fab.addEventListener('pointercancel', finishDrag);
+    fab.addEventListener('lostpointercapture', finishDrag);
+    fab.addEventListener('click', (e) => {
+        if (Date.now() < fabClickSuppressUntil) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+    }, true);
+}
+
+function showFloatingBall() {
+    const fab = document.getElementById(FAB_ID);
+    if (!fab) return;
+    floatingBallShown = true;
+    fab.classList.add('is-active');
+    applyThemeAttr(fab);
+    bindFabDrag();
+    positionFloatingBall();
+    bindFabPositionListeners();
+}
+function hideFloatingBall() {
+    document.getElementById(FAB_ID)?.classList.remove('is-active');
+}
+function setFloatingBallEnabled(enabled) {
+    const s = extension_settings[extensionName];
+    if (!s) return;
+    s.floating_ball = !!enabled;
+    saveSettingsDebounced();
+    if (s.floating_ball) showFloatingBall();
+    else hideFloatingBall();
+}
+
+// --- 背景图片（所有主题通用）---
+// 三种模式：none（不额外设置）/ character（当前角色卡头像，默认）/ custom（图床链接）。
+// 实际 URL 写到 <html> 的 --hh-user-bg-image 并加 .hh-user-bg；CSS 里按主题套不同的暖纸/暗色罩层。
+const BACKGROUND_MODES = ['none', 'character', 'custom'];
+const BACKGROUND_MODE_META = {
+    none: { icon: 'fa-image', label: '不设置背景图' },
+    character: { icon: 'fa-user', label: '当前角色卡' },
+    custom: { icon: 'fa-link', label: '自定义图片' },
+};
+function backgroundMode() {
+    const s = extension_settings[extensionName] || {};
+    let m = s.background_mode || 'character';
+    if (!BACKGROUND_MODES.includes(m)) m = 'character';
+    // 自定义模式但链接为空 → 视为未设置（避免旧配置留下一个永远没有图的模式）
+    if (m === 'custom' && !String(s.background_custom_url || '').trim()) m = 'character';
+    return m;
+}
+function cssUrlValue(url) {
+    return `url("${String(url).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}")`;
+}
+// 当前聊天角色卡头像：优先读 #avatar_load_preview（元素可能稍后才更新），取不到再用角色卡 avatar 拼 URL 兜底。
+function getCharacterAvatarUrl() {
+    const img = document.querySelector('#avatar_load_preview');
+    const src = img?.currentSrc || img?.src || '';
+    if (src) return src;
+    const ctx = getContext?.();
+    const ch = ctx?.characters?.[ctx?.characterId];
+    if (ch?.avatar) {
+        try { return new URL(`/characters/${encodeURIComponent(ch.avatar)}`, location.href).href; } catch (e) { /* 忽略 */ }
+    }
+    return '';
+}
+function resolveUserBackgroundUrl() {
+    const mode = backgroundMode();
+    if (mode === 'character') return getCharacterAvatarUrl();
+    if (mode === 'custom') return String(extension_settings[extensionName]?.background_custom_url || '').trim();
+    return '';
+}
+function applyUserBackground() {
+    const root = document.documentElement;
+    if (!root) return;
+    const url = resolveUserBackgroundUrl();
+    if (url) {
+        root.style.setProperty('--hh-user-bg-image', cssUrlValue(url));
+        root.classList.add('hh-user-bg');
+    } else {
+        root.style.removeProperty('--hh-user-bg-image');
+        root.classList.remove('hh-user-bg');
+    }
+}
+function updateBackgroundSelectLabel() {
+    const mode = backgroundMode();
+    const meta = BACKGROUND_MODE_META[mode] || BACKGROUND_MODE_META.character;
+    // 「当前角色卡」模式：直接用角色卡头像（圆角缩略图）代替 fa-user 图标
+    const avatar = mode === 'character' ? getCharacterAvatarUrl() : '';
+    const html = avatar
+        ? `<img class="hh-bg-avatar-icon" src="${escapeHtmlText(avatar)}" alt=""> ${escapeHtmlText(meta.label)}`
+        : `<i class="fa-solid ${meta.icon}"></i> ${meta.label}`;
+    // 使用说明页与提示弹窗共用同一份当前值文案
+    $('#hide-helper-bg-image-select, #hide-helper-notification-bg-select').html(html);
+}
+function setBackgroundMode(mode, { customUrl = null } = {}) {
+    const s = extension_settings[extensionName];
+    if (!s) return;
+    s.background_mode = BACKGROUND_MODES.includes(mode) ? mode : 'character';
+    if (customUrl !== null) s.background_custom_url = String(customUrl || '').trim();
+    updateBackgroundSelectLabel();
+    applyUserBackground();
+    watchAvatarForBackground();
+    saveSettingsDebounced();
+}
+// 切换聊天后头像元素可能异步换图：观察 src 变化，角色卡背景实时更新。
+let avatarBgObserver = null;
+function watchAvatarForBackground() {
+    const img = document.querySelector('#avatar_load_preview');
+    if (!img || avatarBgObserver?.target === img) return;
+    try { avatarBgObserver?.disconnect(); } catch (e) { /* 忽略 */ }
+    avatarBgObserver = new MutationObserver(() => {
+        if (backgroundMode() === 'character') {
+            applyUserBackground();
+            updateBackgroundSelectLabel();
+        }
+    });
+    avatarBgObserver.observe(img, { attributes: true, attributeFilter: ['src'] });
+}
+// 自定义背景图：输入图床链接的小弹窗（复用模拟发送弹窗的骨架与样式）
+function askBackgroundImageUrl(initialValue = '') {
+    return new Promise((resolve) => {
+        const overlay = document.createElement('div');
+        overlay.className = 'hide-modal-overlay hide-sim-overlay hide-bg-overlay';
+        overlay.id = 'hide-helper-bg-overlay';
+        overlay.innerHTML = `
+            <div class="hide-modal-box hide-sim-box hide-bg-box" role="dialog" aria-modal="true" aria-labelledby="hide-bg-title">
+                <div class="hide-modal-header hide-sim-header">
+                    <span id="hide-bg-title">自定义背景图片</span>
+                    <button type="button" class="hide-helper-popup-close-icon hide-sim-close" id="hide-bg-close" title="关闭">&times;</button>
+                </div>
+                <div class="hide-sim-tip">填写图片直链（图床链接），支持 http(s) 或 data:image 链接。背景图会应用到所有主题。</div>
+                <div class="hide-bg-label-row">
+                    <label class="hide-sim-label" for="hide-bg-input">图片链接</label>
+                    <a class="hide-bg-free-host" href="https://catbox.moe/" target="_blank" rel="noopener noreferrer">免费图床</a>
+                </div>
+                <input type="text" id="hide-bg-input" class="hide-sim-input hide-bg-input" placeholder="https://example.com/background.jpg" value="${escapeHtmlText(initialValue)}">
+                <div class="hide-modal-footer hide-sim-footer">
+                    <button type="button" class="menu_button hide-sim-cancel" id="hide-bg-cancel">取消</button>
+                    <button type="button" class="menu_button hide-sim-ok" id="hide-bg-ok">确定</button>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+        applyThemeAttr(overlay);
+        void overlay.offsetWidth;
+        overlay.classList.add('visible');
+        // 焦点落在弹窗容器而非输入框：不弹手机键盘，同时把焦点从聊天输入框移走
+        const bgBox = overlay.querySelector('.hide-modal-box');
+        bgBox?.setAttribute('tabindex', '-1');
+        bgBox?.focus({ preventScroll: true });
+        const input = overlay.querySelector('#hide-bg-input');
+        let done = false;
+        const finish = (value) => {
+            if (done) return;
+            done = true;
+            overlay.classList.remove('visible');
+            setTimeout(() => overlay.remove(), 160);
+            document.removeEventListener('keydown', onKey);
+            resolve(value);
+        };
+        const submit = () => {
+            const url = String(input?.value || '').trim();
+            if (!url) { notify('warning', '请填写图片链接'); return; }
+            finish(url);
+        };
+        const onKey = (e) => {
+            if (e.key === 'Escape') { e.stopPropagation(); finish(null); }
+            // 只有真正点进输入框后才用 Enter 提交，避免弹窗打开时按 Enter 误触发
+            else if (e.key === 'Enter' && document.activeElement === input) { e.preventDefault(); submit(); }
+        };
+        overlay.querySelector('#hide-bg-close')?.addEventListener('click', () => finish(null));
+        overlay.querySelector('#hide-bg-cancel')?.addEventListener('click', () => finish(null));
+        overlay.querySelector('#hide-bg-ok')?.addEventListener('click', submit);
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) finish(null); });
+        document.addEventListener('keydown', onKey);
+    });
+}
+
 // --- 水波纹主题切换 (View Transitions API) ---
-// 以弹窗左下角为圆心，新主题像水波一样向右上角扩散。
+// 与 star 插件同一套方案：只拍一张整页根快照，以弹窗左下角为圆心做裁剪扩散。
+// 不再给弹窗单独设置 view-transition-name —— 少一层元素快照，也避免弹窗上的
+// backdrop-filter 被单独快照；扩散期间整页快照会盖住实时模糊层，合成更省。
 // 浏览器不支持 View Transitions（或系统开启"减少动态效果"）时，自动回退为即时切换。
 let activeThemeTransition = null;
 
-// 选择本次动画的"涟漪表面"：优先主弹窗，其次是主题提示弹窗
+// 与 star 对齐：时长只影响观感，"迅速蔓延"主要靠起步快、收尾缓的缓动表达
+const THEME_RIPPLE_DURATION_MS = 520;
+const THEME_RIPPLE_EASING = 'cubic-bezier(0.22, 1, 0.36, 1)';
+
+// 选择本次动画的"涟漪表面"：提示弹窗可见时优先它（用户正在操作的就是它），否则主弹窗
 // 注意：这两个都是 position:fixed，offsetParent 恒为 null，不能用来判断可见性
 function pickRippleTarget() {
     const isVisible = (el) => !!el && el.getClientRects().length > 0;
-    const main = document.getElementById('hide-helper-popup');
-    if (isVisible(main)) return main;
     const notification = document.getElementById('hide-helper-theme-notification');
     if (isVisible(notification)) return notification;
+    const main = document.getElementById('hide-helper-popup');
+    if (isVisible(main)) return main;
     return null;
 }
 
@@ -331,7 +768,6 @@ function applyThemeWithRipple(newTheme, { afterFinish } = {}) {
     };
 
     const cleanup = () => {
-        document.querySelectorAll('.hh-ripple-surface').forEach(el => el.classList.remove('hh-ripple-surface'));
         document.documentElement.classList.remove('hh-theme-switching');
     };
 
@@ -346,14 +782,12 @@ function applyThemeWithRipple(newTheme, { afterFinish } = {}) {
         return;
     }
 
-    // 计算涟漪几何。
-    // 关键：clip-path 作用在与元素等大的快照伪元素上，坐标系原点在**元素自己的左上角**
-    // （不是视口原点）。所以圆心用元素内坐标：左下角 = (0, height)；
-    // 半径 = 左下角到右上角的对角线长，让扩散终点正好铺满整个弹窗。
+    // 计算涟漪几何。根快照的坐标系原点在视口左上角，所以圆心用弹窗左下角的视口坐标；
+    // 半径取弹窗对角线并多留 40px，确保圆角与投影也一起被新快照覆盖。
     const rect = target.getBoundingClientRect();
-    const originX = 0;
-    const originY = rect.height;
-    const radius = Math.hypot(rect.width, rect.height) + 2;
+    const originX = rect.left;
+    const originY = rect.bottom;
+    const radius = Math.hypot(rect.width, rect.height) + 40;
 
     // 上一次切换动画还没结束则跳过它，避免叠加
     if (activeThemeTransition) {
@@ -366,20 +800,18 @@ function applyThemeWithRipple(newTheme, { afterFinish } = {}) {
     }
 
     try {
-        // view-transition-name 与"冻结微过渡"标记必须和 startViewTransition 同帧生效：
-        // 前者决定快照归属，后者保证旧快照里也不含 0.2s 的颜色过渡
-        target.classList.add('hh-ripple-surface');
+        // "冻结微过渡"标记必须和 startViewTransition 同帧生效，保证旧快照里也不含 0.2s 的颜色过渡
         document.documentElement.classList.add('hh-theme-switching');
 
         const transition = document.startViewTransition(applyNow);
         activeThemeTransition = transition;
 
-        // 用 Web Animations 对"新快照"做裁剪扩散，而不是 CSS keyframes。
+        // 用 Web Animations 对"整页新快照"做裁剪扩散，而不是 CSS keyframes。
         // 好处：起止值都是运行时算出的像素值，无需自定义属性传递，
         // 也可以选用"前快后缓"的平滑缓动，避免 ease-out 尾段爬行造成的卡顿感。
         // ⚠️ 必须同时给出**起止两个**关键帧：只给一个时，浏览器会把缺失的另一端补成
         //    元素自身的底层值（clip-path: none = 整个新快照可见），动画就变成"从整块
-        //    收缩到左下角一点"，视觉上等于没有水波纹（本轮修复的丢失点）。
+        //    收缩到左下角一点"，视觉上等于没有水波纹。
         transition.ready.then(() => {
             if (activeThemeTransition !== transition) return;
             document.documentElement.animate(
@@ -390,10 +822,9 @@ function applyThemeWithRipple(newTheme, { afterFinish } = {}) {
                     ],
                 },
                 {
-                    duration: 620,
-                    easing: 'cubic-bezier(0.4, 0.2, 0.2, 1)',
-                    fill: 'forwards',
-                    pseudoElement: '::view-transition-new(hh-theme-surface)',
+                    duration: THEME_RIPPLE_DURATION_MS,
+                    easing: THEME_RIPPLE_EASING,
+                    pseudoElement: '::view-transition-new(root)',
                 },
             );
         }).catch(() => {});
@@ -416,12 +847,25 @@ function applyThemeWithRipple(newTheme, { afterFinish } = {}) {
     }
 }
 
-// --- 主题提示弹窗辅助函数 ---
+// --- 新版主题/背景提示弹窗辅助函数 ---
 function showThemeNotification() {
     const $notification = $('#hide-helper-theme-notification');
     if ($notification.length === 0) {
         return;
     }
+
+    // 展示即视为已看过并落盘：点确认或刷新后都不再出现
+    const s = extension_settings[extensionName];
+    if (s && !s.theme_notification_viewed_v2) {
+        s.theme_notification_viewed_v2 = true;
+        saveSettingsDebounced();
+    }
+
+    // 同步两个切换按钮的当前值
+    $('#hide-helper-notification-theme-toggle').html(themeToggleHtml(currentTheme()));
+    updateBackgroundSelectLabel();
+    // 防御：确保提示弹窗拿到当前主题（避免创建/显示时机错过 applyTheme）
+    applyThemeAttr($notification[0]);
 
     // 使用 centerPopup 函数居中弹窗
     $notification.show();
@@ -432,6 +876,7 @@ function showThemeNotification() {
 }
 
 function closeThemeNotification() {
+    closeTypeFilterMenu();
     const $notification = $('#hide-helper-theme-notification');
     $(window).off('resize.hideHelperNotification');
     $notification.fadeOut(300, function() {
@@ -440,13 +885,40 @@ function closeThemeNotification() {
 }
 
 // --- 日志级别应用逻辑 ---
+const LOG_LEVEL_TEXTS = ['零日志', '核心日志', '运行日志', '完整日志'];
 function applyLogLevel(level) {
-    Logger.setLogLevel(level);
-    $('#hide-helper-log-level-select').val(level);
+    const n = Number(level) || 0;
+    Logger.setLogLevel(n);
+    const text = LOG_LEVEL_TEXTS[n] || LOG_LEVEL_TEXTS[0];
+    // 现在是按钮 + 自定义菜单（兼容离线夹具里的旧 <select>）
+    const $el = $('#hide-helper-log-level-select');
+    if ($el.length) {
+        if ($el.is('select')) $el.val(n);
+        else $el.html(`<i class="fa-solid fa-list-ul"></i> ${text}`);
+    }
+    const display = document.getElementById('hide-helper-log-level-display');
+    if (display) display.textContent = text;
+}
+// 日志级别变更（旧处理器逻辑抽成函数，按钮菜单与其它入口共用）
+function setLogLevel(newLevel) {
+    const n = Number(newLevel);
+    const level = Number.isFinite(n) ? Math.max(0, Math.min(3, Math.round(n))) : 0;
+    extension_settings[extensionName].logLevel = level;
+    applyLogLevel(level);
+    saveSettingsDebounced();
 
-    // 更新日志级别显示文本
-    const levelTexts = ['零日志', '核心日志', '运行日志', '完整日志'];
-    $('#hide-helper-log-level-display').text(levelTexts[level] || '零日志');
+    const $downloadBtn = $('#hide-helper-download-log');
+    if (level === 3) {
+        $downloadBtn.fadeIn(200);
+        logEnvironmentDetails(); // 切换到3时立马收集一次环境
+    } else {
+        $downloadBtn.fadeOut(200);
+        Logger.logHistory = []; // 非3级别，立刻清空内存垃圾
+    }
+
+    if (level > 0) {
+        console.log(`%c[隐藏助手]`, 'font-weight: bold; color: #28a745;', `日志级别已更改为: ${LOG_LEVEL_TEXTS[level]}`);
+    }
 }
 
 /**
@@ -707,6 +1179,13 @@ async function setFeatureEnabled(key, enabled) {
         } catch (e) { Logger.warn('【功能开关】同步限制楼层失败:', e); }
     } else if (key === 'stats') {
         s.stats_enabled = on;
+        // 预算提醒依赖聊天统计：关掉统计时一并关掉提醒，避免留下一个永远不会触发的开关。
+        if (!on && s.budget_warning_enabled) {
+            s.budget_warning_enabled = false;
+            $('#hh-budget-toggle').prop('checked', false);
+            $('#hh-budget-tokens').prop('disabled', true).css('display', 'none');
+            Logger.debug('【功能开关】聊天统计已关闭 → 上下文预算提醒同步关闭');
+        }
     }
     if (!s.tab_visible || typeof s.tab_visible !== 'object') s.tab_visible = {};
     s.tab_visible[key] = on;
@@ -904,6 +1383,12 @@ function loadSettings() {
         ...defaultSettings, // 先用默认值填充所有
         ...extension_settings[extensionName] // 然后用保存的值覆盖
     });
+    // 旧版的一次性主题提示标记已由 v2 取代，清掉历史字段避免脏数据
+    if (Object.prototype.hasOwnProperty.call(extension_settings[extensionName], 'theme_notification_viewed')) {
+        delete extension_settings[extensionName].theme_notification_viewed;
+        Logger.info('已移除旧字段 theme_notification_viewed');
+        saveSettingsDebounced();
+    }
     // 确保深层对象也被正确初始化
     extension_settings[extensionName].globalHideSettings = extension_settings[extensionName].globalHideSettings || { ...defaultSettings.globalHideSettings };
 
@@ -996,9 +1481,29 @@ function createUI() {
     $("#extensions_settings").append(settingsHtml);
     createInputWandButton();
     createPopup();
+    createFloatingBall();
     setupEventListeners();
+    // 刷新后恢复悬浮球模式（位置由 fab_top 决定）
+    if (isFloatingBallEnabled()) {
+        showFloatingBall();
+    }
     Logger.debug('安排 DOM 缓存初始化');
     setTimeout(() => domCache.init(), 100); // DOM缓存可以稍后初始化
+}
+
+// 创建悬浮球（默认隐藏，进入悬浮球模式时显示）
+// 挂到 <html> 直下：部分酒馆主题会把 body 设为 fixed/加 transform，导致 fixed 子元素跑到左上角。
+function createFloatingBall() {
+    Logger.debug('创建悬浮球');
+    $(`#${FAB_ID}`).remove();
+    const ballHtml = `
+        <div id="${FAB_ID}" class="hide-helper-floating-ball"
+            role="button" tabindex="0" title="打开隐藏助手" aria-label="打开隐藏助手">
+            <i class="fa-solid fa-ghost"></i>
+        </div>`;
+    const ball = $(ballHtml)[0];
+    document.documentElement.appendChild(ball);
+    applyThemeAttr(ball);
 }
 
 // 创建输入区旁的按钮
@@ -1023,7 +1528,8 @@ function createPopup() {
     const popupHtml = `
         <div id="hide-helper-backdrop" class="hide-helper-backdrop"></div>
         <div id="hide-helper-popup" class="hide-helper-popup">
-            <button id="hide-helper-popup-close-icon" class="hide-helper-popup-close-icon">&times;</button>
+            <button id="hide-helper-popup-close-icon" class="hide-helper-popup-close-icon" title="关闭">&times;</button>
+            <button id="hide-helper-popup-minimize-icon" class="hide-helper-popup-minimize-icon" title="收为悬浮球" aria-label="收为悬浮球">&minus;</button>
 
             <!-- 标签页导航 -->
             <div class="popup-tabs-nav">
@@ -1069,6 +1575,23 @@ function createPopup() {
                                 <input type="checkbox" id="hide-mode-toggle">
                                 <span class="hide-helper-slider"></span>
                             </label>
+                        </div>
+
+                        <!-- 上下文预算提醒：超过阈值时弹窗；阈值同时用于统计页「总共」标红 -->
+                        <div class="hide-helper-budget-switch">
+                            <div class="label-group">
+                                <span id="hh-budget-label">上下文预算提醒</span>
+                                <span id="hh-budget-description">设置上下文预算，超过时主动弹窗提示</span>
+                            </div>
+                            <div class="hh-budget-controls">
+                                <input type="number" id="hh-budget-tokens" class="hide-last-n-input hh-budget-input"
+                                    min="1" step="1000" value="400000" disabled style="display: none;"
+                                    title="预算阈值（tokens），统计页「总共」也按它标红">
+                                <label class="hide-helper-switch" title="启用上下文预算提醒（会同时启用聊天统计）">
+                                    <input type="checkbox" id="hh-budget-toggle">
+                                    <span class="hide-helper-slider"></span>
+                                </label>
+                            </div>
                         </div>
                         <div class="hide-helper-popup-footer hide-helper-popup-footer-center">
                             <button id="hide-unhide-all-btn" class="hide-helper-btn">
@@ -1117,6 +1640,15 @@ function createPopup() {
                                     <li><strong>插件冲突</strong>：若其他插件/脚本也具备自动隐藏功能，请仅启用其中一个，避免运行逻辑打架。</li>
                                     <li><strong>核心原理</strong>：在没有其他脚本干预的情况下，本插件能确保仅发送最近 N 条消息。除了执行隐藏操作外，插件还会从底层<strong>直接截断发送的上下文</strong>，从根本上保证发送的消息层数符合设定。</li>
                                 </ul>
+
+                                <p><strong>6. 上下文预算提醒</strong></p>
+                                <p>在【保留最新 N 条】下方新增了<strong>上下文预算提醒</strong>：开启后可设置预算阈值（tokens，默认 400000）。每次实际发送或模拟发送统计完成后，如果本轮上下文总量达到阈值，就会弹窗提醒。</p>
+                                <ul>
+                                    <li><strong>它只是提醒</strong>：不会自动隐藏楼层，也不会拦截或缩短本次发送；要真正减少上下文，请调小保留楼层 N，或清理世界书/其他上下文。</li>
+                                    <li><strong>依赖聊天统计</strong>：开启提醒会同时启用【聊天统计】；关闭聊天统计时，提醒也会自动关闭。</li>
+                                    <li><strong>阈值同时用于标红</strong>：聊天统计页的「总共」达到该阈值时会变红，方便快速判断。</li>
+                                    <li><strong>弹窗按钮</strong>：「打开隐藏助手」会直接打开插件并切到「隐藏楼层」页，方便调整；「确认」只关闭提醒。</li>
+                                </ul>
                             </div>
                         </div>
                     </div>
@@ -1163,8 +1695,16 @@ function createPopup() {
                         <!-- 主题切换按钮 -->
                         <div class="theme-switch-container">
                             <span class="theme-switch-label">UI主题</span>
-                            <button id="hide-helper-theme-toggle" class="hide-helper-btn">
-                                <i class="fa-solid fa-moon"></i> 切换为暗色模式
+                            <button id="hide-helper-theme-toggle" class="hide-helper-btn" title="点击切换主题">
+                                <i class="fa-solid fa-palette"></i> 日系
+                            </button>
+                        </div>
+
+                        <!-- 背景图片（所有主题通用） -->
+                        <div class="theme-switch-container hh-bg-setting-container">
+                            <span class="theme-switch-label">背景图片</span>
+                            <button id="hide-helper-bg-image-select" class="hide-helper-btn" title="背景图会应用到所有主题">
+                                <i class="fa-solid fa-image"></i> 不设置背景图
                             </button>
                         </div>
 
@@ -1220,13 +1760,17 @@ function createPopup() {
                         <div class="log-level-selector-wrapper" style="display: none;">
                         <div class="log-level-switch-container">
                             <span class="log-level-label">日志级别</span>
-                            <select id="hide-helper-log-level-select" class="hide-helper-select log-level-select">
-                                <option value="0">零日志 (无输出)</option>
-                                <option value="1">核心日志 (错误+警告)</option>
-                                <option value="2">运行日志 (全部运行信息)</option>
-                                <option value="3">完整日志 (含调试)</option>
-                            </select>
+                            <button type="button" id="hide-helper-log-level-select" class="hide-helper-btn" title="选择日志级别">
+                                <i class="fa-solid fa-list-ul"></i> 零日志
+                            </button>
                         </div>
+                        </div>
+
+                        <!-- 图文使用说明入口（紧跟在「日志级别」下方） -->
+                        <div class="hh-guide-entry-row">
+                            <button type="button" id="hh-open-stats-guide" class="hide-helper-btn">
+                                <i class="fa-solid fa-images"></i> 查看图文使用说明
+                            </button>
                         </div>
 
                         <video class="instructions-video" controls muted loop playsinline>
@@ -1281,6 +1825,14 @@ function createPopup() {
                         <p>
                            <strong>示例：</strong> 您设置加载 <code>20</code> 条消息。即使完整对话有1000条，聊天窗口也只加载并显示最后20条。如果需要查看更早的消息，可以点击聊天底部的“Show more messages”按钮。
                         </p>
+
+                        <h2>聊天统计 (功能三)</h2>
+                        <p>
+                            聊天统计会在<strong>每一次实际发送</strong>后，把这一轮的内容构成记录下来：聊天 / 世界书 / 其他各占多少 token、世界书里具体注入了哪些条目、各条各占多少，并把这份记录<strong>锚定到对应的楼层</strong>上。之后可以随时回看任意一楼，也可以把两楼的构成放在一起对比。
+                        </p>
+                        <p class="important">
+                            <i class="fa-solid fa-circle-info"></i> 统计口径是「<strong>实际发送出去的内容</strong>」，不是聊天界面上显示的内容 —— 被👻隐藏的楼层没有发出去，自然也不计入。
+                        </p>
                     </div>
                 </div>
             </div>
@@ -1294,23 +1846,32 @@ function createPopup() {
         $('body').append(overlayHtml);
     }
 
-    // 添加主题提示弹窗的HTML（如果需要显示）
-    if (!extension_settings[extensionName].theme_notification_viewed) {
+    // 【使用说明】页的「聊天统计 · 图文使用说明」入口按钮。
+    // 用事件委托绑在 document 上：这一整块 UI 在初始化时只追加一次，但万一重复初始化，
+    // off + on 的组合也只会留一个处理器，不会出现点一下开两个窗。
+    $(document).off('click.hhStatsGuideEntry').on('click.hhStatsGuideEntry', '#hh-open-stats-guide', function (e) {
+        e.preventDefault();
+        openStatsGuideModal();
+    });
+
+    // 添加新版主题/背景提示弹窗（v2，只显示一次）
+    if (!extension_settings[extensionName].theme_notification_viewed_v2) {
+        const notificationBgMeta = BACKGROUND_MODE_META[backgroundMode()] || BACKGROUND_MODE_META.character;
         const notificationHtml = `
             <div id="hide-helper-theme-notification" class="hide-helper-notification-popup">
                 <div class="notification-content">
-                    <div class="notification-icon">
-                        <i class="fa-solid fa-moon"></i>
+                    <h3>插件已提供白天/黑夜/日系 三套UI主题</h3>
+                    <p>支持添加背景图片<br>可以在【使用说明】进行循环切换</p>
+                    <div class="notification-switch-row">
+                        <button type="button" id="hide-helper-notification-theme-toggle" class="hide-helper-btn notification-action-btn notification-switch-btn" title="点击切换主题">
+                            ${themeToggleHtml(currentTheme())}
+                        </button>
+                        <button type="button" id="hide-helper-notification-bg-select" class="hide-helper-btn notification-action-btn notification-switch-btn" title="选择背景图片">
+                            <i class="fa-solid ${notificationBgMeta.icon}"></i> ${notificationBgMeta.label}
+                        </button>
                     </div>
-                    <h3>插件现已提供白天/黑夜两套UI主题</h3>
-                    <p>可以在【使用说明】页面进行切换。</p>
-                    <div class="notification-buttons">
-                        <button id="hide-helper-switch-theme-now" class="hide-helper-btn notification-primary-btn">
-                            <i class="fa-solid fa-moon"></i> 立即切换到黑夜主题
-                        </button>
-                        <button id="hide-helper-notification-close" class="hide-helper-btn notification-secondary-btn">
-                            我已知晓
-                        </button>
+                    <div class="notification-confirm-row">
+                        <button type="button" id="hide-helper-notification-confirm" class="hide-helper-btn notification-action-btn notification-primary-btn notification-confirm-btn">确认</button>
                     </div>
                 </div>
             </div>`;
@@ -2282,15 +2843,22 @@ function claimInterval(slot, start, end) {    for (const [s, e] of slot.claimed)
     return true;
 }
 
-// 在最终消息（slots，含 user/assistant，不分角色）中查找条目锚点，返回命中的字符区间
+// 在最终消息（slots，含 user/assistant，不分角色）中查找条目锚点，返回命中的字符区间。
+// ⚠️ 同一条目**只认领一个槽位**：ST 侧每个条目只有一个 position（world-info.js 的 switch 只把它
+//    放进一个桶），所以一条目在一次发送里绝不可能出现两次；出现多处命中一定是文本匹配把别的
+//    提示词里的同文片段误认成了本条目（实测：某深度注入条目被另一条 uuid 提示词里的片段"二次命中"，
+//    合计被撑大）。这里先收集**候选**命中（不占位），挑"包含得最完整"的那个槽位，再只对该槽位占位。
+//    先挑后占位是为了不留下"已占位但被丢弃"的区间——那会把本该属于其他条目的文字永久锁死。
 function findEntrySpans(visibleText, slots) {
     const anchors = extractAnchors(visibleText);
-    const spans = [];
     const totalChars = String(visibleText).length || 1;
-    let matchedChars = 0;
+    const candidates = new Map();   // slotIdx -> { slot, spans: [{ start, end }] }
+    // 覆盖率按**单个槽位**算（取最大值）：同一段锚点可能同时命中多个槽位，
+    // 若跨槽累加，一次命中三处就会被当成"已覆盖 95%"而提前收工，后面的锚点不再收集。
+    let bestMatchedChars = 0;
 
     for (const anchor of anchors) {
-        if (matchedChars / totalChars >= 0.95) break;
+        if (bestMatchedChars / totalChars >= 0.95) break;
         for (const slot of slots) {
             if (!slot.text) continue;
             let from = 0;
@@ -2299,16 +2867,48 @@ function findEntrySpans(visibleText, slots) {
                 const idx = slot.text.indexOf(anchor, from);
                 if (idx === -1) break;
                 const end = idx + anchor.length;
-                if (claimInterval(slot, idx, end)) {
-                    spans.push({ slot, start: idx, end });
-                    matchedChars += anchor.length;
+                const entry = candidates.get(slot.index) || { slot, spans: [] };
+                // 候选集合内部也去重叠（同一段文字被相邻锚点重复命中时只留一份）
+                if (!entry.spans.some(s => idx < s.end && end > s.start)) {
+                    entry.spans.push({ start: idx, end });
+                    candidates.set(slot.index, entry);
+                    const slotChars = entry.spans.reduce((s, x) => s + (x.end - x.start), 0);
+                    if (slotChars > bestMatchedChars) bestMatchedChars = slotChars;
                 }
                 from = end;
                 hits++;
             }
         }
     }
-    return spans;
+    if (!candidates.size) return [];
+
+    // 候选槽位按"包含得最完整"排序：① 整段可见文本在该槽位里原样出现；② 命中字符数最多；③ 槽位靠前。
+    const ranked = [...candidates.entries()]
+        .map(([slotIdx, entry]) => ({
+            entry,
+            score: {
+                whole: !!visibleText && entry.slot.text.includes(visibleText),
+                chars: entry.spans.reduce((s, x) => s + (x.end - x.start), 0),
+                slotIdx,
+            },
+        }))
+        .sort((a, b) => (Number(b.score.whole) - Number(a.score.whole))
+            || (b.score.chars - a.score.chars)
+            || (a.score.slotIdx - b.score.slotIdx));
+
+    // 只对**选中的那一个**槽位占位；跨条目防重复计数仍由 claimInterval 负责。
+    // 若首选槽位的区间已被前面处理过的条目占满（同文重复的极端情况），顺次退到下一候选，
+    // 而不是直接把这个条目记成 0。
+    for (const { entry } of ranked) {
+        const spans = [];
+        for (const s of entry.spans) {
+            if (claimInterval(entry.slot, s.start, s.end)) {
+                spans.push({ slot: entry.slot, start: s.start, end: s.end });
+            }
+        }
+        if (spans.length) return spans;
+    }
+    return [];
 }
 
 // 合并相邻命中区间后，按"所属消息"取出文本片段，供 token 计数与归属回填。
@@ -2969,25 +3569,20 @@ function classifyPromptSlot({ identifier, isChat, isChatFloor, isIdentityFloor, 
 //   slots           = [{ tokens, isChat, identifier }]（按发送顺序）
 //   slotKind[i]     = classifyPromptSlot 的结果
 //   entries         = [{ key, position, depth, role, weight, name, book, type, uid }]（后四项只供下层展示用）
-//   entryMatchToken = Map<key, Map<slotIdx, tokens>>（条目在槽位的精确命中量；weight 用于余量分摊）
-// 返回 { wi, chat, perEntry: Map<key, tokens>, perSlotEntries: Map<slotIdx, Map<key, tokens>> }。
-//   perSlotEntries 与 perEntry **同源同值**，只是按槽位保留明细：供「完整上下文」逐条列出该消息的
-//   世界书条目来源（左侧子弹窗，CHANGELOG §2.30）。
-// 世界书槽位通常整条计入 wi，并在其"归属条目组"内把 token 分成 精确命中 + 余量按 weight 加权；
+//   entryMatchToken = Map<key, Map<slotIdx, tokens>>（条目在槽位的精确命中量）
+// 返回 { wi, chat, perEntryOwn: Map<key, tokens>, perSlotEntries: Map<slotIdx, Map<key, tokens>> }。
+//   perEntryOwn    = **自身命中值**：只算该条目自己正文被精确认领的部分，不含任何余量分摊。
+//                    条目列表与条目详情展示这个数——它就是"这条目正文在本次上下文里有多大"。
+//   perSlotEntries = 逐槽位的自身命中明细（与 perEntryOwn 同源），供「完整上下文」列出该消息由哪些条目组成。
+// 世界书槽位通常整条计入 wi（wi 是「世界书」栏的量，按来源槽位确定，与条目明细分开计）；
 // 唯一的例外是 kind='wi-merged'（同一条消息里既有世界书内容又混着第三方文本，D1/D2′）：
 // 只把"被世界书命中的部分"计入 wi，其余按原角色归回 chat/other，避免把第三方文本算成世界书。
-// 无归属条目的世界书槽位仍整条计入 wi（由调用方补差额到明细）。
+// 槽位里不属于任何条目正文的部分（分隔符 / 未匹配残余）不再摊到条目上，由调用方单列为「未归属」。
 function attributeSlotsBySource({ slots, slotKind, entries, entryMatchToken }) {
-    const byKey = new Map(entries.map(e => [e.key, e]));
-    const perEntry = new Map(entries.map(e => [e.key, 0]));
+    const perEntryOwn = new Map(entries.map(e => [e.key, 0]));
     const matchedKeysInSlot = (idx) => entries
         .filter(e => (entryMatchToken.get(e.key)?.get(idx) || 0) > 0)
         .map(e => e.key);
-    const posGroupKeys = (pos) => entries.filter(e => e.position === pos).map(e => e.key);
-    const weightOf = (k) => {
-        const w = byKey.get(k)?.weight;
-        return (typeof w === 'number' && w > 0) ? w : 1;
-    };
     // 槽位里"属于世界书"的 token 量与其余量的归属（余量挂到与原槽同角色的栏位：
     // 聊天槽回到 chat，其余（含 system 角色的混合槽）回到 other）
     const contentInfo = (idx) => {
@@ -2999,26 +3594,8 @@ function attributeSlotsBySource({ slots, slotKind, entries, entryMatchToken }) {
     };
     const slotOwnClaimedOf = (idx) => matchedKeysInSlot(idx)
         .reduce((sum, k) => sum + (entryMatchToken.get(k)?.get(idx) || 0), 0);
-    // 槽位 → 条目组：用于把"世界书那一部分"分摊到条目明细
-    const groupOf = (idx, kind) => {
-        if (kind === 'wi-before') return posGroupKeys(0);
-        if (kind === 'wi-after') return posGroupKeys(1);
-        const matchedKeys = matchedKeysInSlot(idx);
-        // 混合槽（squash 合并 / 同槽混入）：本槽命中哪些条目，就在这些条目之间分摊——
-        // 若按"命中条目的 position 归纳一个组"，另一 position 的命中量会被漏掉（明细会偏向一侧）。
-        if (kind === 'wi-merged' && matchedKeys.length) return matchedKeys;
-        if (matchedKeys.length) {
-            const mp = byKey.get(matchedKeys[0])?.position;
-            const md = byKey.get(matchedKeys[0])?.depth;
-            const mr = byKey.get(matchedKeys[0])?.role;
-            return entries
-                .filter(e => e.position === mp && (mp !== 4 || (e.depth === md && e.role === mr)))
-                .map(e => e.key);
-        }
-        return entries.filter(e => entryMatchToken.get(e.key)?.has(idx)).map(e => e.key);
-    };
     let wi = 0, chat = 0;
-    // 逐槽的条目分摊（键 = 槽位数组下标，与 entryMatchToken 的键同口径）
+    // 逐槽的条目明细（键 = 槽位数组下标，与 entryMatchToken 的键同口径）；值一律是「自身命中」。
     const perSlotEntries = new Map();
     slots.forEach((slot, idx) => {
         const kind = slotKind[idx];
@@ -3027,24 +3604,19 @@ function attributeSlotsBySource({ slots, slotKind, entries, entryMatchToken }) {
         const content = contentInfo(idx);
         wi += content.wiTokens;
         if (content.rest > 0 && content.restTo === 'chat') chat += content.rest;
-        const group = groupOf(idx, kind);
-        if (!group.length) return;
-        let matchedSum = 0, wSum = 0;
-        for (const k of group) {
-            matchedSum += entryMatchToken.get(k)?.get(idx) || 0;
-            wSum += weightOf(k);
-        }
-        const remainder = Math.max(0, content.wiTokens - matchedSum);
+        // 逐槽明细只收「自身命中」：该条目这一段正文在本槽位里真正被认领了多少。
+        // 槽位里没被任何条目认领的部分（分隔符 / 未匹配残余）不进条目，
+        // 由调用方用「世界书总量 − Σ自身命中」单列为「未归属」。
         const slotMap = new Map();
-        for (const k of group) {
-            const w = weightOf(k);
-            const t = (entryMatchToken.get(k)?.get(idx) || 0) + remainder * (w / wSum);
-            perEntry.set(k, (perEntry.get(k) || 0) + t);
-            if (t > 0) slotMap.set(k, t);
+        for (const k of matchedKeysInSlot(idx)) {
+            const own = entryMatchToken.get(k)?.get(idx) || 0;
+            if (own <= 0) continue;
+            perEntryOwn.set(k, (perEntryOwn.get(k) || 0) + own);
+            slotMap.set(k, own);
         }
         if (slotMap.size) perSlotEntries.set(idx, slotMap);
     });
-    return { wi, chat, perEntry, perSlotEntries };
+    return { wi, chat, perEntryOwn, perSlotEntries };
 }
 
 // 计算"实际发送"的完整统计（总量 + 世界书条目归因）
@@ -3126,6 +3698,10 @@ async function computeRenderedStats(messages, options = {}) {
     const sendable = computeSendableChat(options.chatSnapshot, options.genType);
 
     const entrySlotTokens = new Map(); // entryKey -> Map<slotIdx, tokens>：条目在各槽位**精确命中**的 token
+    // entryKey -> Map<slotIdx, text>：条目在各槽位里**实际发送出去的正文**。
+    //   优先存完整可见文本（保留空行；EJS 条目为渲染后文本），找不到才退回命中区间切片。
+    //   仅随上下文快照保存，**不写入聊天文件**。
+    const entrySlotText = new Map();
     const entrySpanSlots = new Map();  // entryKey -> Set<slotIdx>
     const entryFirstPos = new Map();   // entryKey -> pos|null
     // 第二十九轮（用户口径④"世界书条目的滚动定位还是不够准确"）：
@@ -3141,17 +3717,30 @@ async function computeRenderedStats(messages, options = {}) {
         if (statsClearedAt > startedAt) return null;
         const key = entryKey(entry);
         const visibleText = visibleTexts.get(key) || '';
+        // findEntrySpans 内部保证"同一条目只认领一个槽位"（详见其注释）。
         const spans = findEntrySpans(visibleText, slots);
         const piecesBySlot = extractSpanPiecesBySlot(spans);
         const perSlot = new Map();
+        const textBySlot = new Map();
         for (const [slot, pieces] of piecesBySlot) {
-            let t = 0;
-            for (const piece of pieces) t += await cachedTokenCount(piece);
+            // 「实际发送的正文」：优先取条目「可见文本」在本槽位里的完整出现 —— 保留空行、与原文一致；
+            // EJS 条目则是渲染后的文本。
+            // ⚠️ 找不到整段时**只能拼命中片段**，绝不能取"首个命中 → 最后命中"的切片：
+            //    同一槽位可能长达数万字（深度注入块里混着聊天内容），条目正文的两端片段一旦被
+            //    无关内容隔开，切片会把中间那几万字全部算进这个条目 —— 实测出现过
+            //    条目正文 1.5k 字、详情却按 7.7k 字/6495 tokens 记账的严重虚高。
+            const wholeInSlot = !!visibleText && slot.text.includes(visibleText);
+            const actualText = wholeInSlot ? visibleText : pieces.join('\n');
+            // token 口径与「实际发送的正文」严格同源：**数的是哪段字，就按哪段字计数**
+            // （用户口径：列表数字必须能在条目详情里对上）。
+            const t = await cachedTokenCount(actualText);
             if (!t) continue;
             perSlot.set(slot.index, t);
+            textBySlot.set(slot.index, actualText);
             slotOwnClaimed.set(slot.index, (slotOwnClaimed.get(slot.index) || 0) + t);
         }
         entrySlotTokens.set(key, perSlot);
+        entrySlotText.set(key, textBySlot);
         entrySpanSlots.set(key, new Set(perSlot.keys()));
         let pos = null;
         const firstInSlot = new Map();   // slotIdx -> 该条目在这个槽位里最早的命中字符偏移
@@ -3341,26 +3930,31 @@ async function computeRenderedStats(messages, options = {}) {
         .map(d => `#${d.i} ${d.id ?? '∅'}=${d.kind}(${d.tokens}${d.claimed ? '/' + d.claimed : ''}${d.win !== null ? ' win=' + d.win : ''})`)
         .join(' | '));
 
-    // 按来源槽位归因（纯函数）：世界书槽位整条计入 wi，并把其中 token 分摊到各条目；其余按角色分到 chat/other。
+    // 按来源槽位归因（纯函数）：世界书槽位整条计入 wi 并按角色分到 chat/other；
+    // 条目明细一律是「自身命中」口径（该条目正文被精确认领多少），不含任何余量分摊。
     const attr = attributeSlotsBySource({
         slots, slotKind, entries: entriesMeta, entryMatchToken: entrySlotTokens,
     });
-    const entryTokens = attr.perEntry;
+    const entryOwnTokens = attr.perEntryOwn; // 自身命中值：条目列表与详情展示这个
     let wi = attr.wi;
     const chat = attr.chat;
 
-    // 构建世界书明细（四舍五入为整数）；再把舍入 / 未归属槽位的差额补到最大的条目，
-    // 保证「Σ 明细 token」恰好等于 stats.wi（三栏恒等式之外，明细与「世界书」栏也自洽）。
+    // 构建世界书明细。
+    // ⚠️ 展示口径改为「自身命中」（B+D）：record.tokens = 该条目正文被精确认领的 token，
+    //    不再掺入余量分摊，也不再做"把余额整块补给最大条目"那一步——那一步会让单条数字凭空虚高，
+    //    正是用户看到的"实际 tokens 明显偏大且无法解释"的主因。
+    //    「世界书」总量 wi 不受影响（它按来源槽位算），因此明细之和与 wi 之间会有一个差额，
+    //    由 stats.wiUnattributed 单列为「未归属」，界面上显式与条目列表并列展示。
     const wiBuckets = {};
     // 每个条目的「真实插入点」锚点：只算一次，两处共用——① wiDetailedStats 的 record.anchor
     // ② 完整上下文快照里逐条消息的 wiEntries[].anchor（左侧子窗按「上下文顺序」排条目要用）。
     const entryAnchors = new Map();
     const pending = [];
-    let assigned = 0;
+    let assignedOwn = 0;
     for (const entry of scanEntries) {
         const key = entryKey(entry);
-        const t = Math.max(0, Math.round(entryTokens.get(key) || 0));
-        assigned += t;
+        const t = Math.max(0, Math.round(entryOwnTokens.get(key) || 0));
+        assignedOwn += t;
         const bookName = entry.world || 'Embedded/Other';
         const type = entryHasEjs(entry) ? 'ejs' : (entry.constant ? 'constant' : 'dynamic');
         // 真实插入点（由 position/depth 推得）：供「上下文顺序」按"在聊天 #k 之前插入"归组。
@@ -3383,18 +3977,14 @@ async function computeRenderedStats(messages, options = {}) {
             },
         });
     }
-    const surplus = wi - assigned;
-    if (surplus !== 0 && pending.length) {
-        let target = pending[0];
-        for (const p of pending) if (p.record.tokens > target.record.tokens) target = p;
-        target.record.tokens = Math.max(0, target.record.tokens + surplus);
-        target.record.matched = target.record.tokens > 0;
-    }
     for (const p of pending) {
         if (!wiBuckets[p.bookName]) wiBuckets[p.bookName] = { constant: [], dynamic: [], ejs: [], total: 0 };
         wiBuckets[p.bookName][p.type].push(p.record);
         wiBuckets[p.bookName].total += p.record.tokens;
     }
+    // 「未归属」= 世界书总量 − 各条目自身命中之和（在下方钳制后再最终计算，见 stats.wiUnattributed）。
+    // 可能是小幅负数：逐条分词与整段分词存在边界效应（"A"+"B" 分别计数常比 "AB" 整段多 0~1），
+    // 因此条目之和偶尔略大于槽位总量。如实保留符号，界面上按正负分别说明。
 
     // 防御性钳制：确保概览三栏相加恒等于总计。
     if (wi > stats.total) wi = stats.total;
@@ -3402,10 +3992,12 @@ async function computeRenderedStats(messages, options = {}) {
     stats.chat = Math.max(0, Math.min(chat, stats.total - stats.wi));
     stats.other = Math.max(0, stats.total - stats.wi - stats.chat);
     stats.wiDetailedStats = wiBuckets;
+    // 「未归属」用**钳制后**的 wi 算，保证界面上「Σ条目 + 未归属 = 世界书」恒成立。
+    stats.wiUnattributed = stats.wi - assignedOwn;
 
     // 单条消息的世界书条目明细（展示用，见 lastContextDump.wiEntries 注释）。
-    // 与 wiDetailedStats 同源（perSlotEntries），只是**不做**"舍入差额补到最大条目"那一步——
-    // 这里回答的是"这一条消息里有哪些条目、各占多少"，按槽位原样四舍五入即可。
+    // 与 wiDetailedStats 同一套「自身命中」口径：这条消息里该条目正文被认领了多少就是多少，
+    // 不掺余量分摊 / 舍入补差——这里回答的是"这一条消息由哪些条目组成、各占多少"。
 
     const metaByKey = new Map(entriesMeta.map(m => [m.key, m]));
     const slotEntriesOf = (i) => {
@@ -3421,7 +4013,7 @@ async function computeRenderedStats(messages, options = {}) {
             // → 世界书条目的滚动联动高亮会"一下跳好几个"（用户口径④）。
             const offInSlot = entrySlotFirstPos.get(k)?.get(i);
             const pos = (offInSlot === undefined || offInSlot === null)
-                ? (entryFirstPos.get(k) ?? null)   // 本槽位没有精确命中（余量分摊得到的 token）→ 退回旧口径
+                ? (entryFirstPos.get(k) ?? null)   // 本槽位没有记录到偏移 → 退回全部槽位的首个命中
                 : (i * 1e6 + offInSlot);
             // 定位提示（第二十九轮）：条目可见文本里第一个行锚点（与文本匹配用的是同一套锚点）。
             // 内容区里"条目正文从第几个字符开始"直接用它 `indexOf` 定位 —— 比单靠 pos 偏移稳：
@@ -3431,6 +4023,8 @@ async function computeRenderedStats(messages, options = {}) {
             out.push({
                 name: meta.name, book: meta.book, type: meta.type, uid: meta.uid,
                 tokens: Math.max(1, Math.round(t)),
+                // 实际命中的正文片段（弹出「条目详情」时默认展示这段"实际发送的内容"）
+                content: entrySlotText.get(k)?.get(i) || '',
                 // 该条目自己的"真实插入点"（与 wiDetailedStats 的 anchor 是同一份推导）：
                 // 左侧子窗按「上下文顺序」排条目、并渲染聊天位置标记行时要用它。
                 anchor: entryAnchors.get(k) || null,
@@ -3451,6 +4045,9 @@ async function computeRenderedStats(messages, options = {}) {
     lastContextDump = {
         genType: options.genType || null,
         total: stats.total,
+        // 与 stats.at 同源的时间戳：详情窗据此校验"这份快照就是该锚点当前统计的那一次"，
+        // 避免消息删除导致下标漂移 / IndexedDB 写入失败时，把旧快照的正文配到新统计上。
+        statsAt: startedAt,
         messages: slots.map((s, i) => ({
             i: s.index,
             role: s.role,
@@ -3458,7 +4055,8 @@ async function computeRenderedStats(messages, options = {}) {
             identifier: typeof s.identifier === 'string' ? s.identifier : null,
             kind: slotKind[i],
             text: String(s.text ?? ''),
-            // 世界书来源的消息：该条的**条目明细** [{ name, book, type, uid, tokens }]（非世界书消息为 null）。
+            // 世界书来源的消息：该条的**条目明细** [{ name, book, type, uid, tokens, content }]（非世界书消息为 null）。
+            // content = 该条目在此槽位里实际命中的正文片段（条目详情窗默认展示的"实际发送内容"）。
             // 数据来源 = attributeSlotsBySource 的 perSlotEntries（与 wiDetailedStats 同源同值，只是按槽位保留），
             // 于是左侧子窗能回答"这条世界书消息具体由哪些条目组成"。仅内存、不落盘。
             wiEntries: isWiKind(slotKind[i]) ? slotEntriesOf(i) : null,
@@ -3549,7 +4147,7 @@ function writeAnchoredStats(anchor, stats, dump = null) {
     }
 
     pruneAnchoredStats();
-    // 完整上下文快照（仅内存）：跟着锚点一起入库，供「完整上下文」查看器读取
+    // 完整上下文快照（内存 + IndexedDB 副本）：跟着锚点一起入库，供「完整上下文」查看器与条目详情读取
     saveContextDump(anchor.chatId, anchor.index, anchor.source || 'real', dump);
     return true;
 }
@@ -3582,7 +4180,10 @@ function resolveAnchorTarget(genType, chat) {
 
 // normal 生成的锚定补写：统计往往先于 AI 回复到达。
 // `allowFallback=false`（回复尚未到达时的常规检查）→ 继续等待，返回 false；
-// `allowFallback=true`（生成已结束/中止/超时兜底）→ 仍没有回复就回退写到触发消息上，保证统计不丢。
+// `allowFallback=true`（生成已结束/中止/超时兜底）→ 仍没有回复就**丢弃本次统计**。
+// ⚠️ 绝不回退写到"触发消息"上：触发消息可能根本不是 API 生成的（典型：#0 是角色卡预置开场白）。
+//    实测事故：某次 normal 生成没有产生任何新消息（被中止 / 第三方静默生成 / 空输入），
+//    旧实现把整份统计回退锚到触发消息 ⇒ 预置的 #0 上凭空出现了"聊天统计"。
 function flushPendingReplyAnchor(reason = '', allowFallback = false) {
     const pending = pendingReplyAnchor;
     if (!pending) return false;
@@ -3591,19 +4192,24 @@ function flushPendingReplyAnchor(reason = '', allowFallback = false) {
         pendingReplyAnchor = null;
         return false;
     }
+    // 只认"触发消息之后新追加的那条非用户消息"。位置对不上（下标漂移/插入了别的消息）也不认。
     const reply = context.chat[pending.triggerIndex + 1];
     const hasReply = !!(reply && !reply.is_user);
-    if (!hasReply && !allowFallback) return false; // 回复还没到 → 继续等待
+    if (!hasReply) {
+        if (!allowFallback) return false; // 回复还没到 → 继续等待
+        pendingReplyAnchor = null;
+        Logger.debug(`【统计】本次生成没有产生 AI 回复，丢弃锚定${reason ? ` @${reason}` : ''}`);
+        return false;
+    }
 
     pendingReplyAnchor = null;
-    const target = hasReply
-        ? { chatId: pending.chatId, index: pending.triggerIndex + 1, messageRef: reply, source: 'real' }
-        : { chatId: pending.chatId, index: pending.triggerIndex, messageRef: context.chat[pending.triggerIndex], source: 'real' };
+    const target = { chatId: pending.chatId, index: pending.triggerIndex + 1, messageRef: reply, source: 'real' };
     if (!target.messageRef) return false;
     const ok = writeAnchoredStats(target, pending.stats, pending.dump);
     if (ok) {
-        Logger.debug(`【统计】锚定到生成的消息 #${target.index}${hasReply ? '（AI 回复）' : '（回退：触发消息）'}${reason ? ` @${reason}` : ''}`);
+        Logger.debug(`【统计】锚定到生成的消息 #${target.index}${reason ? ` @${reason}` : ''}`);
         updateTokenStatsUI();
+        maybeShowBudgetWarning(pending.stats?.total);
     }
     return ok;
 }
@@ -3693,7 +4299,50 @@ function escapeHtmlText(s) {
     return String(s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
 }
 
+// 「内容区只显示字符」的守卫（条目详情正文 / 完整上下文内容块）。
+// 我们自己的写入已经 escapeHtmlText 过，理论上不会有元素；但实测环境里存在第三方扩展对文本节点做
+// HTML/图片渲染（把 <cg-card> / <img> 变成真实元素）的情况。这里在容器上挂一个 MutationObserver：
+// 除了白名单（检索高亮用的 <mark>），任何元素子节点一律降级成它的纯文本。
+// 只作用于我们自己这两个内容容器，不碰页面其它区域。
+const textOnlyGuards = new WeakMap();
+function sanitizeTextOnlySubtree(root, allowed) {
+    if (!root || root.nodeType !== 1) return;
+    const nodes = [root, ...root.querySelectorAll('*')];
+    for (const node of nodes) {
+        if (allowed.has(node.tagName)) continue;
+        if (!node.parentNode) continue;   // 父节点已被前面的替换带走
+        // 用 outerHTML 而不是 textContent：把被渲染出来的标签本身（如 <img src="...">）
+        // 原样还原成可见字符，而不是只留下它的文字内容（图片的文字内容是空的）。
+        node.replaceWith(document.createTextNode(node.outerHTML || node.textContent || ''));
+    }
+}
+function enforceTextOnlyContent(el, allowedTags = ['MARK']) {
+    if (!el || typeof MutationObserver === 'undefined') return;
+    const allowed = new Set(allowedTags);
+    // 一次性清理已有元素
+    for (const child of Array.from(el.children)) sanitizeTextOnlySubtree(child, allowed);
+    if (textOnlyGuards.has(el)) return;
+    try {
+        const mo = new MutationObserver((records) => {
+            if (!el.isConnected) {
+                try { mo.disconnect(); } catch (e) { /* 忽略 */ }
+                textOnlyGuards.delete(el);
+                return;
+            }
+            for (const r of records) {
+                for (const n of r.addedNodes) {
+                    if (n.nodeType === 1) sanitizeTextOnlySubtree(n, allowed);
+                }
+            }
+        });
+        mo.observe(el, { childList: true, subtree: true });
+        textOnlyGuards.set(el, mo);
+    } catch (e) { /* 观察失败就只做一次性清理 */ }
+}
+
 // 汇总一个锚点的统计数字（供对比表使用）
+// 分类型合计用「自身命中」口径（与条目列表一致）；wi 仍是来源槽位口径，
+// 两者之差统一记为 unattr（世界书里不属于任何条目的部分 / 分词边界差）。
 function getAnchorSummary(stats) {
     const det = stats?.wiDetailedStats || {};
     let constant = 0, dynamic = 0, ejs = 0, entries = 0, matched = 0;
@@ -3715,7 +4364,10 @@ function getAnchorSummary(stats) {
     const total = Number(stats?.total) || 0;
     const chat = Number(stats?.chat) || 0;
     const wi = Number(stats?.wi) || 0;
-    return { total, chat, wi, other: Math.max(0, total - chat - wi), constant, dynamic, ejs, entries, matched };
+    const unattr = Number.isFinite(Number(stats?.wiUnattributed))
+        ? Number(stats.wiUnattributed)
+        : wi - (constant + dynamic + ejs);
+    return { total, chat, wi, other: Math.max(0, total - chat - wi), constant, dynamic, ejs, entries, matched, unattr };
 }
 
 // 相对基准的差值小字（基准列自身不显示）
@@ -3852,22 +4504,23 @@ function askSimulateContent(initialValue = '') {
                     placeholder="（可留空，直接按下方按钮模拟发送）"></textarea>
                 <div class="hide-modal-footer hide-sim-footer">
                     <button type="button" class="menu_button hide-sim-cancel" id="hide-sim-cancel">取消</button>
-                    <button type="button" class="menu_button primary hide-sim-ok" id="hide-sim-ok">模拟发送</button>
+                    <button type="button" class="menu_button hide-sim-ok" id="hide-sim-ok">模拟发送</button>
                 </div>
             </div>`;
         document.body.appendChild(overlay);
-        // 主题：与主弹窗同一套判定（applyTheme 写的是 data-theme="dark"）
-        if ((extension_settings[extensionName]?.theme || 'light') === 'dark') {
-            overlay.setAttribute('data-theme', 'dark');
-        }
+        // 主题：与主弹窗同一套判定（light 不写属性，其余写 data-theme="dark|galgame"）
+        applyThemeAttr(overlay);
         // 强制 reflow 后再加 .visible，让 CSS 的入场动画真的跑起来
         void overlay.offsetWidth;
         overlay.classList.add('visible');
+        // 焦点落在弹窗容器而非输入框：不弹手机键盘，同时把焦点从聊天输入框移走
+        const simBox = overlay.querySelector('.hide-modal-box');
+        simBox?.setAttribute('tabindex', '-1');
+        simBox?.focus({ preventScroll: true });
 
         const ta = overlay.querySelector('#hide-sim-input');
         ta.value = initialValue;
-        ta.focus();
-        ta.setSelectionRange(ta.value.length, ta.value.length);
+        // 不自动聚焦：避免打开弹窗就弹出手机键盘；需要输入时用户自己点输入框
 
         let done = false;
         const finish = (value) => {
@@ -3882,7 +4535,11 @@ function askSimulateContent(initialValue = '') {
         const onKey = (ev) => {
             if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); finish(null); return; }
             // Ctrl/Cmd + Enter = 确认（textarea 里裸 Enter 要留给换行）
-            if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); finish(ta.value); }
+            // 焦点不在弹窗内时忽略，避免弹窗打开后（未聚焦）误触确认
+            if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey) && overlay.contains(document.activeElement)) {
+                ev.preventDefault();
+                finish(ta.value);
+            }
         };
         document.addEventListener('keydown', onKey, true);
         overlay.querySelector('#hide-sim-ok').addEventListener('click', () => finish(ta.value));
@@ -3946,9 +4603,7 @@ function showSimulateProgress() {
                 <div class="hide-sim-progress-title">正在模拟发送…</div>
                 <div class="hide-sim-progress-tip">正在用当前上下文真实组装一次请求（含世界书与 EJS 渲染）并统计 token 来源。<br>不会发往 API、不消耗 token、不新增消息，请稍候。</div>
             </div>`;
-        if ((extension_settings[extensionName]?.theme || 'light') === 'dark') {
-            overlay.setAttribute('data-theme', 'dark');
-        }
+        applyThemeAttr(overlay);
         document.body.appendChild(overlay);
         void overlay.offsetWidth;   // 强制 reflow 后再加 .visible，让入场动画真的跑起来
     }
@@ -4103,6 +4758,18 @@ async function runSimulateSend(rawContent) {
     rawContent = String(rawContent ?? '');
     const trimmed = rawContent.trim();
 
+    // 本次统计的结算信号：SETTINGS_READY 里把统计任务入队时把 queued 置 true，
+    // 任务真正跑完（含统计页刷新）才 resolve；进度弹窗据此决定何时收起。
+    const statsWait = { queued: false, settled: false, promise: null, resolve: null };
+    statsWait.promise = new Promise((resolve) => {
+        statsWait.resolve = () => {
+            if (statsWait.settled) return;
+            statsWait.settled = true;
+            resolve();
+        };
+    });
+    simulateStatsWait = statsWait;
+
     // 第三十五轮用户口径⑤：整个生成阶段显示"正在生成中"提示弹窗（finally 里必定收起）。
     // 原来这里改的是 `#tub-simulate-btn` 的文案 —— 该按钮已按用户口径②删除，改为独立遮罩。
     showSimulateProgress();
@@ -4247,8 +4914,11 @@ async function runSimulateSend(rawContent) {
 
         // 4) UI 复位
         try { context.activateSendButtons?.(); } catch (e) { /* 忽略 UI 复位异常 */ }
-        // 第三十五轮：收起"正在生成中"提示弹窗（与 showSimulateProgress 成对；finally 里必定执行）
-        hideSimulateProgress();
+        // 第三十五轮：收起"正在生成中"提示弹窗（与 showSimulateProgress 成对；finally 里必定执行）。
+        // ⚠️ 生成管线只是前半程：token 统计在 SETTINGS_READY 里入队异步执行，锚定与统计页刷新都在那之后。
+        //    因此这里只负责"统计任务没跑起来"的兜底（队列没收到任务 → 立即 resolve），
+        //    真正收起进度弹窗放到下面 await 之后（见 6）。
+        if (!statsWait.queued) statsWait.resolve?.();
 
         // 5) 落盘：管线中途可能已写过盘（tainted / lastInContextMessageId / 元数据），
         //    仅当聊天未切换、消息数未变、且确有改动时才重写，冲掉临时状态；否则跳过以防污染。
@@ -4261,8 +4931,28 @@ async function runSimulateSend(rawContent) {
             Logger.warn('【模拟发送】检测到聊天切换或消息数变化，跳过落盘以防污染（内存状态已还原）。');
         }
 
+        // 6) 等统计真正算完再收起进度弹窗（用户口径：弹窗消失时必须已经是刷新后的数字）。
+        //    统计任务由 SETTINGS_READY 入队，串行队列可能还要排在别人的任务之后，因此给一个兜底超时，
+        //    避免队列卡住时遮罩永远盖在界面上（超时只影响遮罩，统计完成后仍会自动刷新界面）。
+        const STATS_WAIT_TIMEOUT_MS = 60000;
+        let waitTimer = null;
+        await Promise.race([
+            statsWait.promise,
+            new Promise((resolve) => { waitTimer = setTimeout(resolve, STATS_WAIT_TIMEOUT_MS); }),
+        ]);
+        clearTimeout(waitTimer);
+        if (!statsWait.settled) {
+            Logger.warn('【模拟发送】等待统计超时，先收起进度弹窗（统计完成后会自动刷新界面）');
+            statsWait.resolve?.();
+        }
+        // 等待期间若用户又发起了一次模拟（simulateInProgress 已复位），遮罩属于新一轮，不能替它收起
+        const superseded = simulateStatsWait !== statsWait;
+        if (!superseded) simulateStatsWait = null;
+        // 第三十五轮：收起"正在生成中"提示弹窗（与 showSimulateProgress 成对；finally 里必定执行）
+        if (!superseded) hideSimulateProgress();
+
         // 复位锚定栏（模拟按钮已删，但「模拟中…」的 busy 态与菜单项仍需重渲染）
-        updateTokenStatsUI();
+        if (!superseded) updateTokenStatsUI();
     }
 }
 
@@ -4286,8 +4976,49 @@ function parseAnchorId(raw) {
 //      `#tub-open-outline` → 打开「上下文目录 + 完整上下文」这一对窗口；
 //      `#tub-open-chat-stats` → 打开「聊天」统计子窗。
 //   这样锚定栏只剩两行：第一行（明细/对比切换 + 锚点菜单 + 两个图标），不再有乱七八糟的 chip 流。
-function renderAnchorBar(list, opts = {}) {
-    const el = document.getElementById('tub-anchor-bar');
+// 「明细 / 对比」切换滑块：渲染后把指示条放到当前按钮下方；若给了旧位置，则从旧位置滑过去。
+function syncViewToggleIndicator(toggle, fromRect = null) {
+    if (!toggle) return;
+    const indicator = toggle.querySelector('.tub-view-indicator');
+    const active = toggle.querySelector('.tub-view-btn.active');
+    if (!indicator || !active) return;
+    const tr = toggle.getBoundingClientRect();
+    const ar = active.getBoundingClientRect();
+    if (!ar.width) return;
+    const toLeft = ar.left - tr.left;
+    const toWidth = ar.width;
+    indicator.style.left = `${toLeft}px`;
+    indicator.style.width = `${toWidth}px`;
+    if (!fromRect?.width) return;
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return;
+    if (typeof indicator.animate !== 'function') return;
+    indicator.animate(
+        [
+            { left: `${fromRect.left}px`, width: `${fromRect.width}px` },
+            { left: `${toLeft}px`, width: `${toWidth}px` },
+        ],
+        { duration: 240, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
+    );
+}
+
+// 字体异步加载、弹窗显隐等都会改变按钮宽度；宽度一变就重新贴合滑块。
+let viewToggleResizeObserver = null;
+function observeViewToggleResize(toggle) {
+    if (!toggle || typeof ResizeObserver === 'undefined') return;
+    if (!viewToggleResizeObserver) {
+        viewToggleResizeObserver = new ResizeObserver(() => {
+            const t = document.querySelector('#tub-anchor-bar .tub-view-toggle');
+            if (t) syncViewToggleIndicator(t);
+        });
+    }
+    viewToggleResizeObserver.disconnect();
+    viewToggleResizeObserver.observe(toggle);
+    // 字体加载后两个按钮的宽度可能各自变化、容器总宽却未必变：当前按钮也要观察
+    const active = toggle.querySelector('.tub-view-btn.active');
+    if (active) viewToggleResizeObserver.observe(active);
+}
+
+function renderAnchorBar(list, opts = {}) {    const el = document.getElementById('tub-anchor-bar');
     if (!el) return;
     const { selectedId = null, latestId = null, defaultCombo = null, compareId = null } = opts || {};
 
@@ -4319,6 +5050,7 @@ function renderAnchorBar(list, opts = {}) {
     let html = `
         <div class="tub-anchor-head">
             <div class="tub-view-toggle">
+                <span class="tub-view-indicator" aria-hidden="true"></span>
                 <button class="tub-view-btn${isDetail ? ' active' : ''}" data-view="detail">明细</button>
                 <button class="tub-view-btn${!isDetail ? ' active' : ''}" data-view="compare">对比</button>
             </div>
@@ -4329,14 +5061,17 @@ function renderAnchorBar(list, opts = {}) {
         // 第三十六轮用户口径③：第二行 = 「选择楼层 [第 9 楼 ▾] [▤][💬]」
         //   · 原「锚定」二字改成「选择楼层」；
         //   · 两个图标**紧跟在锚点选择框右侧**（原来在行尾）、**去掉了边框与底色**（只剩图标本身）。
-        const anchorText = selectedItem ? anchorMenuItemLabel(selectedItem, simDisplayId) : '暂无锚定';
+        // 没有任何锚定数据时：选择框默认显示「模拟发送」（点开菜单即可触发模拟），
+        // 并沿用模拟锚点的虚线/异色样式，让"这是模拟入口"一眼可见。
+        const anchorText = selectedItem ? anchorMenuItemLabel(selectedItem, simDisplayId) : '模拟发送';
         const anchorTip = selectedItem?.isSim
             ? (simulateContent.trim() ? `模拟内容：${simulateContent}` : '模拟内容：（空）')
-            : (selectedItem ? `锚定时间 ${formatAnchorTime(selectedItem.stats?.at)}` : '');
+            : (selectedItem ? `锚定时间 ${formatAnchorTime(selectedItem.stats?.at)}` : '暂无统计数据，点击可模拟发送');
+        const simLike = !selectedItem || !!selectedItem.isSim;
         html += `
             <div class="tub-anchor-row">
                 <span class="tub-anchor-row-label">选择楼层</span>
-                <button type="button" class="tub-anchor-select${selectedItem?.isSim ? ' is-sim' : ''}${simulating ? ' busy' : ''}"
+                <button type="button" class="tub-anchor-select${simLike ? ' is-sim' : ''}${simulating ? ' busy' : ''}"
                     id="tub-anchor-select" title="${escapeHtmlText(anchorTip ? `选择要查看的锚定统计（${anchorTip}）` : '选择要查看的锚定统计')}">
                     <span class="tub-anchor-select-text">${escapeHtmlText(anchorText)}</span>
                 </button>
@@ -4344,6 +5079,9 @@ function renderAnchorBar(list, opts = {}) {
             </div>
         `;
         el.innerHTML = html;
+        syncViewToggleIndicator(el.querySelector('.tub-view-toggle'), pendingViewToggleSlide);
+        pendingViewToggleSlide = null;
+        observeViewToggleResize(el.querySelector('.tub-view-toggle'));
         bindAnchorBarEvents(el, list, { latestId, defaultCombo, simDisplayId });
         return;
     }
@@ -4368,6 +5106,9 @@ function renderAnchorBar(list, opts = {}) {
         </div>
     `;
     el.innerHTML = html;
+    syncViewToggleIndicator(el.querySelector('.tub-view-toggle'), pendingViewToggleSlide);
+    pendingViewToggleSlide = null;
+    observeViewToggleResize(el.querySelector('.tub-view-toggle'));
     bindAnchorBarEvents(el, list, { latestId, defaultCombo, simDisplayId });
     bindBaselineMenu(el, combos, { selectedId, compareId, defaultCombo, simDisplayId });
 }
@@ -4378,6 +5119,15 @@ function bindAnchorBarEvents(el, list, { latestId = null, simDisplayId = null } 
         btn.onclick = () => {
             const v = btn.getAttribute('data-view');
             if (v === statsViewMode) return;
+            const toggle = btn.closest('.tub-view-toggle');
+            const indicator = toggle?.querySelector('.tub-view-indicator');
+            let fromRect = null;
+            if (toggle && indicator) {
+                const tr = toggle.getBoundingClientRect();
+                const ir = indicator.getBoundingClientRect();
+                if (ir.width) fromRect = { left: ir.left - tr.left, width: ir.width };
+            }
+            pendingViewToggleSlide = fromRect;
             statsViewMode = v;
             updateTokenStatsUI();
         };
@@ -4461,8 +5211,18 @@ function bindAnchorMenu(el, list, { latestId = null, simDisplayId = null } = {})
         text: anchorMenuItemLabel(item, simDisplayId),
         cls: item.isSim ? 'tub-type-menu-item-sim' : '',
     }));
-    // 动作项用哨兵 value（不会与任何锚点 id 冲突：真实锚点是数字、模拟锚点是 'sim'）
-    actions.push({ value: '__simulate__', text: '模拟发送', cls: 'tub-type-menu-item-action' });
+    // 动作项用哨兵 value（不会与任何锚点 id 冲突：真实锚点是数字、模拟锚点是 'sim'）。
+    // 没有任何锚点时菜单里只剩这一项 → 加 is-only-action，去掉顶部分隔线与上边距。
+    actions.push({
+        value: '__simulate__',
+        text: '模拟发送',
+        cls: `tub-type-menu-item-action${actions.length ? '' : ' is-only-action'}`,
+    });
+    // 没有任何锚点时菜单只剩「模拟发送」这一项：按钮点击直接打开模拟发送弹窗，不再弹单行菜单。
+    if (actions.length === 1) {
+        trigger.onclick = () => triggerSimulate();
+        return;
+    }
     trigger.onclick = () => {
         if (openTypeMenuTrigger === trigger) { closeTypeFilterMenu(); return; }
         openTypeFilterMenu(trigger, {
@@ -4711,6 +5471,7 @@ function renderCompareContent(list, baselineIndex, compareIndex) {
                 ${numRow(TYPE_FILTER_LABELS.constant, 'constant')}
                 ${numRow(TYPE_FILTER_LABELS.dynamic, 'dynamic')}
                 ${numRow('EJS', 'ejs')}
+                ${numRow('未归属', 'unattr')}
                 ${numRow('已激活条目', 'entries')}
                 ${numRow('已匹配条目', 'matched')}
             </tbody>
@@ -4792,6 +5553,7 @@ function renderCompareContent(list, baselineIndex, compareIndex) {
 
     // 点击条目差异表里的条目 → 打开条目详情子窗（按"书名 + UID/条目名"定位）。
     // 行序与 renderEntryDiffTable 一致（同一套过滤函数），因此用序号对齐。
+    // tokens 传「对比」列（右侧）的值：详情窗展示的正是那一列锚点的实际发送数据。
     const visibleRows = applyEntryDiffFilters(diff, statsCmpBookFilter, statsCmpTypeFilter)
         .flatMap(g => g.rows);
     el.querySelectorAll('.tub-cmp-entry-row').forEach((row, i) => {
@@ -4803,6 +5565,8 @@ function renderCompareContent(list, baselineIndex, compareIndex) {
                 uid: row.getAttribute('data-uid'),
                 type: row.getAttribute('data-type'),
                 tokens: rec ? (rec.vals[1] ?? null) : null,
+                anchorId: list[cmpPos]?.index,   // 右侧「对比」那一列的实际发送数据
+                anchorAt: list[cmpPos]?.stats?.at ?? null,
             });
         };
     });
@@ -5035,6 +5799,31 @@ function sortEntriesByMode(combined, mode, edges) {
     return combined;
 }
 
+// ── 「世界书筛选栏」的统一口径（第四十五轮）──
+//   0 本  → 整条筛选栏不渲染（返回 ''）
+//   1 本  → 只显示这一本的书名、恒为 active；**不出现**「所有条目」（单书时它与「该书」是同一集合）
+//   ≥2 本 → 「所有条目」+ 各书名
+// 书名一律 escapeHtmlText：世界书名允许含 " < & 等字符。主面板此前直接拼 `${b}`，
+// 书名里带引号会把 data-book 属性截断 → 点击后 currentBookFilter 变成不存在的键 → 列表恒空。
+// 调用方约定：**传进来的 books 只应包含"在本视图里确实有行"的书**（否则会出现点了必空的死按钮）。
+function buildBookFilterButtonsHtml(books, activeBook = 'all') {
+    const list = Array.isArray(books) ? books.filter(b => typeof b === 'string' && b) : [];
+    if (!list.length) return '';
+    const effectiveActive = list.length === 1 ? list[0] : activeBook;
+    const allBtn = list.length > 1
+        ? `<button class="tub-book-btn${effectiveActive === 'all' ? ' active' : ''}" data-book="all">所有条目</button>`
+        : '';
+    return allBtn + list.map(b =>
+        `<button class="tub-book-btn${effectiveActive === b ? ' active' : ''}" data-book="${escapeHtmlText(b)}">${escapeHtmlText(b)}</button>`
+    ).join('');
+}
+
+// 带 .tub-book-filters 外层的版本（主面板 header 的插槽用）：空集合 → 整段 ''（连空容器都不留）
+function buildBookFiltersHtml(books, activeBook = 'all') {
+    const inner = buildBookFilterButtonsHtml(books, activeBook);
+    return inner ? `<div class="tub-book-filters">${inner}</div>` : '';
+}
+
 // ── 「已激活条目」列表的共用渲染（主弹窗明细视图 ↔ 世界书消息条目子窗，CHANGELOG §2.30）──
 // 抽出的原因：左侧「世界书条目来源」子弹窗要复刻同一套列表（同样的行样式、同样的"位置标记行"口径），
 // 各写一份必然漂移，故把三块**纯**渲染逻辑提出来共用（调用方各自持有自己的容器与状态）。
@@ -5093,6 +5882,11 @@ function createEntryRowBuilder({ booksCount = 1, bookFilter = 'all', absoluteMax
         const valueHtml = e.matched
             ? `${e.tokens}`
             : `<span class="tub-book-tag" title="未能在此次实际发送的上下文中定位到该条目内容（点击查看原因）">未匹配</span>`;
+        // 列表里的数字是「实际计入」：世界书槽位分摊值（含未命中部分/分隔符分摊），
+        // 与条目正文自身的 token 数不是同一个口径（条目详情窗里会分别标出）。
+        const valueTitle = e.matched
+            ? ' title="实际计入：本轮世界书槽位分摊到该条目的 tokens（含未命中部分与分隔符分摊，可能大于条目正文 tokens）"'
+            : '';
 
         const rid = ++seq;
         records.set(rid, e);
@@ -5104,7 +5898,7 @@ function createEntryRowBuilder({ booksCount = 1, bookFilter = 'all', absoluteMax
         // ⚠️ 行内**不再有任何图标**，`.tub-nli-value` 就只剩 tokens 数字。
         return `<div class="tub-new-list-item tub-entry-clickable" data-rid="${rid}" data-book="${escapeHtmlText(e.b)}" data-name="${escapeHtmlText(e.name)}" data-uid="${e.uid ?? ''}" data-type="${e.type}" title="${escapeHtmlText(rowTitle)}" style="${gradientBg}${unmatchedStyle}">
                 <div class="tub-nli-label" title="${escapeHtmlText(e.name)}">${escapeHtmlText(e.name)}${bookTag}</div>
-                <div class="tub-nli-value">${valueHtml}</div>
+                <div class="tub-nli-value"${valueTitle}>${valueHtml}</div>
                 ${metaLine(e)}
             </div>`;
     };
@@ -5229,7 +6023,7 @@ function renderTokenStatsContent(model) {
 
     // 本聊天尚无锚定统计（还没发送过消息）
     if (totalTokens === null || totalTokens === undefined) {
-        overviewEl.innerHTML = '<div class="tub-empty-state">暂无统计数据：发送一条消息后会自动统计并显示。</div>';
+        overviewEl.innerHTML = '<div class="tub-empty-state">暂无统计数据：发送一条消息后会自动统计并显示，或者点击“模拟发送”</div>';
         document.getElementById('tub-row-wi-chart').innerHTML = '';
         document.getElementById('tub-entries-section').innerHTML = '';
         return;
@@ -5241,10 +6035,11 @@ function renderTokenStatsContent(model) {
     // 「总共」框可点击：**直接**开出「上下文目录（左）+ 完整上下文（右）」这一对窗口
     //   （第二十九轮用户口径①：原来的第一层「完整上下文」查看器内容重复，已整体删除）。
     // 「聊天」框可点击：打开聊天统计子弹窗（实际发送范围 / AI token 均值 / 生成速度 / 历史折线）。
-    // 「总共」框在总量达到预算阈值（200000）时标红预警。
-    const overBudget = totalTokens >= STATS_BUDGET_TOKENS;
+    // 「总共」框在总量达到预算阈值时标红预警（阈值可在「隐藏楼层」页调整，默认 400000）。
+    const budget = getBudgetTokens();
+    const overBudget = totalTokens >= budget;
     const totalTitle = `点击查看完整上下文（左侧上下文目录 + 右侧实际发送的 ${totalTokens} tokens 全文）`
-        + (overBudget ? `；⚠️ 总量已达 ${STATS_BUDGET_TOKENS} 的预算上限` : '');
+        + (overBudget ? `；⚠️ 总量已达 ${budget} 的预算上限` : '');
     overviewEl.innerHTML = `
         <div class="tub-stat-box tub-stat-box-clickable${overBudget ? ' tub-stat-box-over-budget' : ''}" data-stat="total" title="${escapeHtmlText(totalTitle)}"><span class="tub-stat-label">总共</span><span class="tub-stat-value">${totalTokens}<br><small>${overBudget ? '超出预算' : '实际发送'}</small></span></div>
         <div class="tub-stat-box tub-stat-box-clickable" data-stat="chat" title="点击查看：实际发送的消息范围 / AI 平均 tokens / AI 平均生成速度 / 最近七条 AI 消息折线"><span class="tub-stat-label">聊天</span><span class="tub-stat-value">${chatTokens}<br><small>${getPct(chatTokens)}%</small></span></div>
@@ -5259,15 +6054,33 @@ function renderTokenStatsContent(model) {
     if (chatStatBox) chatStatBox.onclick = (ev) => { ev.stopPropagation(); toggleChatStatsPopup(model, chatStatBox); };
 
     // 渲染条目列表（含排序/过滤工具栏）
-    const books = Object.keys(statsObj);
+    // 世界书筛选按钮的书名集合（第四十五轮，用户口径两条）：
+    //   ① 「没有条目被实际发送的世界书」不列。桶是按**扫描激活**的条目无条件建的（见 computeRenderedStats），
+    //      所以直接 Object.keys(statsObj) 会给出"点了必然为空"的死按钮
+    //      （实测：Eldoria matched 0 / tokens 0，却有按钮，点进去只有空态）。
+    //      判据用 record.matched —— 含义是"该条目在本轮实际上下文中认领到 token > 0"。
+    //   ② 例外：「病态锚点」（世界书栏 token 为 0，但扫描确实激活了条目）。此时 matched 全为 false
+    //      并不代表"没被发送"，而是"发送了却没能在实际上下文中定位到正文"。书名本身就是唯一排查线索，
+    //      必须保留 —— 否则筛选栏整条消失，用户无从知道是哪本书出的问题（历史上正是这样被报过）。
+    let wiAllEntriesCount = 0;
+    let wiMatchedEntryCount = 0;
+    for (const b in statsObj) {
+        for (const t of TYPE_FILTER_ORDER) {
+            for (const e of (statsObj[b]?.[t] || [])) {
+                wiAllEntriesCount++;
+                if (e?.matched) wiMatchedEntryCount++;
+            }
+        }
+    }
+    const wiUnlocatedWarn = wiTokens === 0 && wiAllEntriesCount > 0;
+    const books = Object.keys(statsObj).filter(b => TYPE_FILTER_ORDER.some(t => {
+        const list = statsObj[b]?.[t] || [];
+        if (!list.length) return false;
+        return wiUnlocatedWarn || list.some(e => e?.matched);
+    }));
     // 类型过滤触发器：按钮 + 浮层菜单（见 openTypeFilterMenu）。菜单项在打开时按"当前数据里真实存在的类型"生成。
 
-    const bookFiltersHtml = books.length > 1
-        ? `<div class="tub-book-filters">
-                <button class="tub-book-btn active" data-book="all">所有条目</button>
-                ${books.map(b => `<button class="tub-book-btn" data-book="${b}">${b}</button>`).join('')}
-            </div>`
-        : '';
+    const bookFiltersHtml = buildBookFiltersHtml(books, 'all');
 
     const sectionHtml = `
         <div id="tub-entries-header-sticky" class="tub-entries-header-sticky">
@@ -5304,7 +6117,8 @@ function renderTokenStatsContent(model) {
     let currentBookFilter = 'all';
     let currentSearchTerm = '';
 
-    // 按当前世界书过滤聚合饼图数据（常量/动态/EJS）
+    // 按当前世界书过滤聚合饼图数据（常量/动态/EJS）。
+    // 三者都是「自身命中」口径（与条目列表同源），另出一份「未归属」= 世界书总量 − 三条目和。
     const computePieForBook = (bookFilter) => {
         let c = 0, d = 0, e = 0;
         for (const b in statsObj) {
@@ -5313,7 +6127,14 @@ function renderTokenStatsContent(model) {
             (statsObj[b].dynamic || []).forEach(x => { d += x.tokens; });
             (statsObj[b].ejs || []).forEach(x => { e += x.tokens; });
         }
-        return { c, d, e, total: c + d + e };
+        // 「未归属」只在看全部世界书时有意义（按单本筛选时，wi 总量无法拆到单本，
+        // 强行分摊只会造出一个假数字）；单本视图下传 0，饼图三片即该书的自身命中构成。
+        let unattr = 0;
+        if (bookFilter === 'all') {
+            const wi = Number(model.wiTokens) || 0;
+            unattr = wi - (c + d + e);
+        }
+        return { c, d, e, unattr, total: c + d + e + Math.max(0, unattr) };
     };
     // 当前「世界书过滤」范围内实际存在的类型集合（决定类型过滤菜单里出现哪些选项）。
     // ⚠️ 只算 matched 的条目：未匹配条目已被列表过滤掉（用户口径①），若把它们算进可用类型，
@@ -5370,9 +6191,9 @@ function renderTokenStatsContent(model) {
             pushEntries(statsObj[b].constant, 'constant', b);
         }
 
-        // 饼图跟随当前世界书过滤
+        // 饼图跟随当前世界书过滤（自身命中口径 + 未归属扇区）
         const pie = computePieForBook(currentBookFilter);
-        renderPieView(pie.c, pie.d, pie.e, pie.total);
+        renderPieView(pie.c, pie.d, pie.e, pie.total, pie.unattr);
 
         const filterTotal = filterTotalC + filterTotalD + filterTotalE;
         // 构建顶部总数显示，如果有 EJS 则显示红色部分
@@ -5391,14 +6212,19 @@ function renderTokenStatsContent(model) {
         sortEntriesByMode(combined, statsListSortMode, ctxEdges);
 
         if (!combined.length) {
-            entriesContainer.innerHTML = '<div class="tub-empty-state">没有激活的条目</div>';
+            // 病态锚点（世界书栏 token = 0，但扫描确实激活了条目）：此时说「没有激活的条目」是误导 ——
+            // 条目确实被激活了，只是没能在本轮实际发送的上下文里定位到正文（计 0 tokens）。
+            entriesContainer.innerHTML = wiUnlocatedWarn
+                ? `<div class="tub-empty-state">世界书扫描激活了 ${wiAllEntriesCount} 条条目`
+                    + `（其中 ${wiAllEntriesCount - wiMatchedEntryCount} 条未能在本次实际发送的上下文中定位到正文），`
+                    + `因此 token 计为 0 —— 可能被正则/宏/EJS 清空，或被酒馆跳过注入。</div>`
+                : '<div class="tub-empty-state">没有激活的条目</div>';
             return;
         }
-
         const matchedTokens = combined.filter(e => e.matched).map(e => e.tokens);
         const absoluteMax = matchedTokens.length ? Math.max(...matchedTokens) : 1;
 
-        // 条目行 → 原始记录表：点击时按 data-rid 取回完整记录（uid/type 等）。
+        // 条目行 → 原始记录表：点击时按 data-rid 取回完整记录（uid/type/tokens 等）。
         // 行 HTML 与"行 → 记录"表由共用构建器产出（与「世界书消息条目」子窗同一套渲染，见 createEntryRowBuilder）。
         const rowBuilder = createEntryRowBuilder({ booksCount: books.length, bookFilter: currentBookFilter, absoluteMax });
         const entryRowHtml = rowBuilder.html;
@@ -5411,7 +6237,30 @@ function renderTokenStatsContent(model) {
             entriesContainer.innerHTML = combined.map(entryRowHtml).join('');
         }
 
-        // 条目行点击 → 打开条目详情子窗（两种模式统一绑定）；按 data-rid 取回原始记录
+        // 底部对账行：Σ条目（自身命中）+ 未归属 = 世界书总量。
+        // 只在「全部世界书」视图下给（单本视图的未归属无法拆到单本，硬凑会造假数字）；
+        // 且当前类型过滤不是「所有」时也给（此时 Σ 只覆盖该类，与 wi 总量不可直接对账）。
+        // 旧锚点没有 wiUnattributed 字段（旧口径已把余量摊进条目）→ 不渲染对账行，避免显示一个假的 0。
+        const hasUnattrField = !!model.stats && Object.prototype.hasOwnProperty.call(model.stats, 'wiUnattributed');
+        if (hasUnattrField && currentBookFilter === 'all' && statsListTypeFilter === 'all' && !currentSearchTerm) {
+            const unattr = Number(model.stats?.wiUnattributed) || 0;
+            const wiTotal = Number(wiTokens) || 0;
+            const entrySum = wiTotal - unattr;
+            const unattrText = unattr >= 0
+                ? `分隔符 / 未匹配：<b>${unattr}</b>`
+                : `逐条分词边界差：<b>${unattr}</b>`;
+            const unattrTip = unattr >= 0
+                ? '世界书槽位里不属于任何条目正文的部分（条目间分隔符、未能匹配上的残余文本）。'
+                : '逐条分别分词之和略大于整段分词：分词接口对每次调用都会附加少量固定开销，条目越多差值越大。差值如实显示为负数。';
+            entriesContainer.insertAdjacentHTML('beforeend', `
+                <div class="tub-entries-tally" title="${unattrTip}">
+                    <span class="tub-entries-tally-label">世界书合计 <b>${wiTotal}</b> = 条目合计 <b>${entrySum}</b> + 未归属 ${unattrText}</span>
+                </div>
+            `);
+        }
+
+        // 条目行点击 → 打开条目详情子窗（两种模式统一绑定）。
+        // tokens 直接把列表里的数传过去：详情默认视图必须与列表完全一致，不再重新分词。
         entriesContainer.querySelectorAll('.tub-entry-clickable').forEach(row => {
             row.onclick = () => {
                 const rec = rowRecords.get(Number(row.getAttribute('data-rid'))) || null;
@@ -5421,6 +6270,8 @@ function renderTokenStatsContent(model) {
                     uid: row.getAttribute('data-uid'),
                     type: row.getAttribute('data-type'),
                     tokens: rec ? rec.tokens : null,
+                    anchorId: model.isSim ? SIM_ANCHOR_ID : model.index,
+                    anchorAt: model.stats?.at ?? null,
                 });
             };
         });
@@ -5428,18 +6279,21 @@ function renderTokenStatsContent(model) {
 
     renderEntriesList();
 
-    // 绑定书籍按钮事件
-    if (books.length > 1) {
-        const btns = document.querySelectorAll('.tub-book-btn');
-        btns.forEach(btn => {
-            btn.onclick = () => {
-                btns.forEach(b => b.classList.remove('active'));
-                btn.classList.add('active');
-                currentBookFilter = btn.getAttribute('data-book');
-                renderEntriesList();
-            };
-        });
-    }
+    // 绑定书籍按钮事件（第四十五轮：门槛与渲染对齐、选择器限定本面板）
+    //   旧实现是 `if (books.length > 1)` + 全局 document.querySelectorAll('.tub-book-btn')：
+    //   ① 渲染门槛与绑定门槛各写一份，改一处就脱节（单书不渲染按钮时这里也必需跟着不绑）；
+    //   ② 全局选择器会把「世界书条目差异」对比栏、以及「本条世界书条目」子窗的按钮**一并改绑**到
+    //      主面板闭包上 —— 在对比栏点书名，实际改的是主面板的 currentBookFilter，还会把对比栏的
+    //      active 高亮抹掉。现在作用域收到本面板 header 内；没有按钮时 NodeList 为空，天然无需门槛。
+    const bookBtns = document.querySelectorAll('#tub-entries-header-sticky .tub-book-btn');
+    bookBtns.forEach(btn => {
+        btn.onclick = () => {
+            bookBtns.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            currentBookFilter = btn.getAttribute('data-book');
+            renderEntriesList();
+        };
+    });
 
     // 排序按钮：默认顺序 <-> 实际上下文顺序
     const sortBtn = document.getElementById('tub-sort-btn');
@@ -5497,15 +6351,18 @@ function renderTokenStatsContent(model) {
 // c/d/e 分别为 常量 / 动态 / EJS 的 token 数；total 为其和。扇区上标注百分比（<5% 不标注）。
 // container 版（CHANGELOG §2.30）：主面板（#tub-row-wi-chart）与「世界书消息条目」子窗共用同一套绘制，
 // 只是容器不同——两处各画一份必然漂移。renderPieView 是主面板口径的薄包装（见下）。
-function renderPieViewInto(container, c, d, e, total) {
+function renderPieViewInto(container, c, d, e, total, unattr = 0) {
     if (!container) return;
     if (!total) { container.innerHTML = '<div class="tub-empty-state">没有激活的世界书</div>'; return; }
 
     const R = 50, CX = 50, CY = 50, LABEL_R = 30; // LABEL_R：百分比文字离圆心的距离
+    // 未归属（分隔符 / 未匹配残余）用中性灰，排在最后；为负（分词边界效应）时不画。
+    const unattrShown = Math.max(0, Number(unattr) || 0);
     const segs = [
         { v: c, color: 'var(--hh-stats-color-constant)' }, // 常量（蓝，最先，从 0% 起）
         { v: d, color: 'var(--hh-stats-color-dynamic)' },  // 动态（绿）
         { v: e, color: 'var(--hh-stats-color-ejs)' },      // EJS（红）
+        { v: unattrShown, color: 'var(--hh-stats-color-unattributed)', label: '未归属' },
     ].filter(s => s.v > 0);
 
     // 从 12 点方向开始顺时针取点（f 为 0~1 的比例，radius 为取值半径）
@@ -5538,6 +6395,13 @@ function renderPieViewInto(container, c, d, e, total) {
         }).join('');
     }
 
+    // 「未归属」为负时（逐条分词比整段多），扇区不画，但在图例里如实标注负差值。
+    const unattrNum = Number(unattr) || 0;
+    const unattrLegend = unattrNum !== 0
+        ? `<div class="tub-legend-item" title="世界书槽位里不属于任何条目的部分（分隔符、未匹配残余）。为负表示逐条分词之和略大于整段（分词接口对每次调用附加少量固定开销）。"
+            ><span class="tub-dot tub-dot-unattributed"></span>未归属: ${unattrNum}</div>`
+        : '';
+
     container.innerHTML = `
         <svg class="tub-pie-svg" viewBox="0 0 100 100" role="img" aria-label="世界书构成">
             ${slices}
@@ -5547,13 +6411,15 @@ function renderPieViewInto(container, c, d, e, total) {
             ${e > 0 ? `<div class="tub-legend-item"><span class="tub-dot tub-dot-red"></span>${TYPE_FILTER_LABELS.ejs}: ${e}</div>` : ''}
             <div class="tub-legend-item"><span class="tub-dot tub-dot-green"></span>${TYPE_FILTER_LABELS.dynamic}: ${d}</div>
             <div class="tub-legend-item"><span class="tub-dot tub-dot-blue"></span>${TYPE_FILTER_LABELS.constant}: ${c}</div>
+            ${unattrLegend}
         </div>
     `;
 }
 
 // 主面板口径的包装：容器固定为 #tub-row-wi-chart
-function renderPieView(c, d, e, total) {
-    renderPieViewInto(document.getElementById('tub-row-wi-chart'), c, d, e, total);
+// unattr：未归属（世界书总量 − 各条目自身命中之和），> 0 时画一片中性灰扇区，保证饼图总量 = 世界书
+function renderPieView(c, d, e, total, unattr = 0) {
+    renderPieViewInto(document.getElementById('tub-row-wi-chart'), c, d, e, total, unattr);
 }
 
 // 滚动条自动隐藏/显示逻辑 (已移除)
@@ -5563,6 +6429,8 @@ function initScrollbarLogic() {
 // ==================== 条目详情子弹窗 ====================
 // 点击「已激活条目」/「世界书条目差异」里的条目时，从世界书实时读出条目定义并展示。
 // 桌面端贴在主弹窗正右方（右侧放不下则换左侧）；窄屏/移动端居中——两种情况尺寸都与主弹窗一致。
+// 「实际发送 ↔ 原世界书」切换图标（两个反向箭头；放在 tokens 左侧）
+const HH_ICON_SWAP = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h13"></path><path d="M14 5l3 3-3 3"></path><path d="M20 16H7"></path><path d="M10 13l-3 3 3 3"></path></svg>';
 
 // 世界书 position 值 → 「插入位置」文案（与 ST 世界书编辑器的中文标签口径一致：
 // 界面截图里的 角色定义前/后、作者注释前/后、示例消息前/后、锚点 ↔ zh-cn.json 的
@@ -5618,8 +6486,7 @@ function ensureEntryPopup() {
     // 绑定一次即可——内容区元素本身长期复用，只有它的 innerHTML 会被替换。
     initHiddenScrollbar(el.querySelector('#hide-entry-body'));
     // 主题跟随主弹窗
-    const theme = extension_settings[extensionName]?.theme || 'light';
-    if (theme === 'dark') el.setAttribute('data-theme', 'dark');
+    applyThemeAttr(el);
     return el;
 }
 
@@ -6036,6 +6903,51 @@ function closeEntryPopup() {
     closeChildPopupAt('hide-helper-entry-popup');
 }
 
+// 从上下文快照里找出某条目"实际发送出去的正文"（统计时逐行锚点命中的原文片段）。
+// 只读 chatId + anchorId 对应的那一份快照 —— **不跨锚点回退**：宁可没有"实际内容"，也不把别的楼层的内容当成本次的。
+// 旧快照没有 content 字段 / 条目未命中 / 快照已淘汰时返回 null（调用方回退到世界书原文）。
+// 返回值 { content, tokens }：**连同统计时记下的 tokens 一起取回**，详情窗直接显示这个数，
+// 不再重新分词（重算会在换分词器 / 缓存失效时与列表数字漂移，也白白多算一遍）。
+// ⚠️ 多处命中时取**正文最长**的那一条（统计侧同样只认领"最完整"的那个槽位，两处必须同一套选法，
+//    否则列表数字与详情正文会来自不同的注入位置，看起来就像"对不上"）。
+function findSentEntryContent({ book, name, uid, anchorId, anchorAt = null } = {}) {
+    if (anchorId === null || anchorId === undefined || anchorId === '') return null;
+    const chatId = getContext?.()?.chatId;
+    if (!chatId) return null;
+    const dump = contextDumpStore.get(contextDumpKey(chatId, anchorId));
+    if (!dump || !Array.isArray(dump.messages)) return null;
+    // 「最新性」校验：快照必须与该锚点**当前**这份统计同源（statsAt 同一次统计的时间戳）。
+    // 不对就当作没有快照（详情退回世界书原文），绝不把旧正文配到新数字上：
+    //   · 消息被删除 → 下标漂移，同一 key 下的快照可能属于别的楼层；
+    //   · IndexedDB 写入失败 → 磁盘上可能还留着该锚点的上一版快照。
+    if (anchorAt !== null && anchorAt !== undefined && dump.statsAt !== anchorAt) {
+        Logger.debug(`【条目详情】快照时间戳不匹配（快照 ${dump.statsAt ?? '无'} / 统计 ${anchorAt}），按无快照处理`);
+        return null;
+    }
+    const wantUid = (uid !== null && uid !== undefined && uid !== '') ? String(uid) : null;
+    const wantBook = book ? String(book) : '';
+    let best = null;
+    for (const m of dump.messages) {
+        for (const e of (Array.isArray(m?.wiEntries) ? m.wiEntries : [])) {
+            if (wantBook && String(e?.book ?? '') !== wantBook) continue;
+            const hit = wantUid
+                ? (e?.uid !== null && e?.uid !== undefined && String(e.uid) === wantUid)
+                : (String(e?.name ?? '') === String(name ?? ''));
+            if (!hit || typeof e?.content !== 'string' || !e.content.trim()) continue;
+            const cand = {
+                content: e.content,
+                tokens: Number.isFinite(Number(e.tokens)) ? Number(e.tokens) : null,
+            };
+            if (!best
+                || cand.content.length > best.content.length
+                || (cand.content.length === best.content.length && (cand.tokens ?? -1) > (best.tokens ?? -1))) {
+                best = cand;
+            }
+        }
+    }
+    return best;
+}
+
 // 读取世界书条目定义：优先 uid 精确匹配，其次按条目名（comment）匹配。
 // 返回 { entry, uid }（uid 为世界书里的真实键；旧锚点记录里没有 uid 时子窗靠它显示）。
 async function fetchWorldEntryDetail(book, name, uid) {
@@ -6058,7 +6970,11 @@ async function fetchWorldEntryDetail(book, name, uid) {
 // 构建条目详情 HTML。
 // 返回 { html, type, typeText }：条目名的着色与副标题行右侧的类型徽标由调用方按 type/typeText 渲染
 // （它们不在 body 里，而在子窗头部），故这里一并返回。
-// extra = { uid, uidFallback }：UID 单独占一行 —— 放在原来「内容（content）」行的位置（内容本身不再展示）。
+// extra = { uid, uidFallback, sentContent, sentTokens }：
+//   · UID 单独占一行，tokens 在右侧；
+//   · sentContent = 本次实际发送时匹配到的正文片段（缺省回退世界书原文）；
+//   · sentTokens  = 统计时给这条正文记下的 token 数。**优先直接用它**，不再重新分词：
+//     统计与展示必须同一个数，重算会在换分词器 / 缓存失效时悄悄漂移，也白白多算一遍。
 async function buildEntryDetailHtml(entry, fallbackType, extra = {}) {
     const type = entryHasEjs(entry) ? 'ejs' : (entry.constant ? 'constant' : (fallbackType || 'dynamic'));
     const typeText = { ejs: TYPE_FILTER_LABELS.ejs, constant: TYPE_FILTER_LABELS.constant, dynamic: TYPE_FILTER_LABELS.dynamic }[type] || TYPE_FILTER_LABELS.dynamic;
@@ -6087,9 +7003,11 @@ async function buildEntryDetailHtml(entry, fallbackType, extra = {}) {
         ? secKeys.map(k => `<span class="hide-entry-key hide-entry-key-sec">${escapeHtmlText(k)}</span>`).join('')
         : '';
 
-    // 「UID / tokens」行：占据原来「内容（content）」标签行的位置 —— **左侧显示 UID，右侧显示 tokens**。
-    // tokens 口径 = 世界书编辑器给条目显示的口径：`cachedTokenCount(entry.content)`（宏未替换、keys 不计入）；
-    // 与「本次发送中命中多少 token」（列表里的数字）是两回事。
+    // 「UID / tokens」行：左 = UID，右 = **当前显示内容**的 tokens。
+    //   · 实际发送视图：tokens = cachedTokenCount(实际内容)。该值与条目列表里的数字**同源同值**
+    //     （统计侧对"整段正文原样出现"的槽位就是按这段正文计数的）；
+    //   · 原世界书视图：tokens = cachedTokenCount(entry.content)，即世界书编辑器里那段模板原文。
+    // 两者只在条目正文被 EJS / 正则改写时才会不同 —— 此时才显示切换图标（见 hasToggle）。
     // uid 回退顺序：锚点记录/行属性 → 世界书真实键（extra.uidFallback）。旧锚点记录无 uid 时靠后者。
     const pickUid = (...cands) => {
         for (const c of cands) {
@@ -6098,10 +7016,28 @@ async function buildEntryDetailHtml(entry, fallbackType, extra = {}) {
         return null;
     };
     const uidValue = pickUid(extra.uid, extra.uidFallback, entry.uid);
-    const entryTokens = await cachedTokenCount(String(entry.content ?? ''));
+    const originalContent = String(entry.content ?? '');
+    const originalTokens = await cachedTokenCount(originalContent);
+
+    const sentContent = (typeof extra.sentContent === 'string' && extra.sentContent.trim()) ? extra.sentContent : null;
+    // 统计值优先；只有旧快照没有存 tokens 时才退回现算（保证旧数据也能看）。
+    const storedSentTokens = Number.isFinite(Number(extra.sentTokens)) ? Number(extra.sentTokens) : null;
+    const sentContentTokens = sentContent === null
+        ? null
+        : (storedSentTokens !== null ? storedSentTokens : await cachedTokenCount(sentContent));
+    const normText = (s) => String(s ?? '').replace(/\r\n?/g, '\n').trim();
+    const hasToggle = sentContent !== null && normText(sentContent) !== normText(originalContent);
+    const defaultIsSent = sentContent !== null;
+    const shownContent = defaultIsSent ? sentContent : originalContent;
+    const shownTokens = defaultIsSent ? (sentContentTokens ?? originalTokens) : originalTokens;
+    const tokenTitle = defaultIsSent ? '实际发送的正文 tokens（与条目列表一致）' : '原世界书条目的 tokens';
+    const toggleBtnHtml = hasToggle
+        ? `<button type="button" class="hide-entry-src-toggle" id="hide-entry-src-toggle"
+                title="切换到原世界书条目的 content / tokens" aria-pressed="true">${HH_ICON_SWAP}</button>`
+        : '';
     const metaRowHtml = `<div class="hide-entry-row hide-entry-meta-row">
             <span class="hide-entry-uid">UID ${uidValue === null ? '—' : escapeHtmlText(String(uidValue))}</span>
-            <span class="hide-entry-tokens">${entryTokens} tokens</span>
+            <span class="hide-entry-meta-right">${toggleBtnHtml}<span class="hide-entry-tokens" id="hide-entry-tokens" title="${tokenTitle}">${shownTokens} tokens</span></span>
         </div>`;
 
     const html = `
@@ -6110,9 +7046,55 @@ async function buildEntryDetailHtml(entry, fallbackType, extra = {}) {
         ${row('顺序', `<span class="hide-entry-plain">${orderText}</span>`)}
         ${row('递归', recursionHtml)}
         ${metaRowHtml}
-        <div class="hide-entry-content">${escapeHtmlText(entry.content ?? '')}</div>
+        <div class="hide-entry-content" id="hide-entry-content">${escapeHtmlText(shownContent)}</div>
     `;
-    return { html, type, typeText };
+    return {
+        html, type, typeText,
+        sourceToggle: hasToggle ? {
+            sentContent,
+            sentTokens: sentContentTokens ?? originalTokens,
+            originalContent,
+            originalTokens,
+            initial: 'sent',
+        } : null,
+    };
+}
+
+// 绑定「实际发送 ↔ 原世界书」切换（只有两者内容不同时才会出现这个图标）。
+// 用 textContent 写入，避免把条目正文当 HTML 解析。
+function bindEntrySourceToggle(bodyEl, spec) {
+    if (!bodyEl || !spec) return;
+    const btn = bodyEl.querySelector('#hide-entry-src-toggle');
+    const contentEl = bodyEl.querySelector('#hide-entry-content');
+    const tokensEl = bodyEl.querySelector('#hide-entry-tokens');
+    if (!btn || !contentEl || !tokensEl) return;
+    let mode = spec.initial === 'original' ? 'original' : 'sent';
+    const render = () => {
+        const isSent = mode === 'sent';
+        const contentTokens = isSent ? spec.sentTokens : spec.originalTokens;
+        contentEl.textContent = isSent ? spec.sentContent : spec.originalContent;
+        tokensEl.textContent = `${contentTokens} tokens`;
+        tokensEl.title = isSent ? '实际发送的正文 tokens（与条目列表一致）' : '原世界书条目的 tokens';
+        btn.classList.toggle('is-original', !isSent);
+        btn.title = isSent ? '切换到原世界书条目的 content / tokens' : '切换回实际发送的 content / tokens';
+        btn.setAttribute('aria-pressed', String(isSent));
+    };
+    btn.addEventListener('click', () => {
+        mode = mode === 'sent' ? 'original' : 'sent';
+        render();
+        // 切换后给一条轻提示，避免用户不确定当前看到的是哪一侧的内容。
+        // 用 toastr 与酒馆原生提示统一；没有 toastr（离线夹具等）时静默跳过。
+        try {
+            if (typeof toastr !== 'undefined' && toastr?.info) {
+                toastr.info(
+                    mode === 'sent' ? '已切换到「实际发送」的正文与 tokens' : '已切换到「原世界书条目」的正文与 tokens',
+                    '隐藏助手',
+                    { timeOut: 1600, extendedTimeOut: 1200, progressBar: false },
+                );
+            }
+        } catch (e) { /* 忽略提示失败 */ }
+    });
+    render();
 }
 
 // 渲染子窗头部：条目名按类型着色（红=EJS / 蓝=常驻 / 绿=动态），副标题行 = 左「所属世界书」+ 右「类型徽标」。
@@ -6133,11 +7115,17 @@ function setEntryPopupHead({ name, book, type }) {
 }
 
 // 打开/刷新条目详情弹窗。连续点击不同条目时，旧请求结果按序号丢弃，只显示最后一次点击的条目。
-// 参数：{ book, name, uid, type }（type 来自行上的 data-type，作为读取完成前的着色提示）
+// 参数：{ book, name, uid, type, tokens, sentContent, anchorId, anchorAt }
+//   · type 来自行上的 data-type，作为读取完成前的着色提示；
+//   · tokens = 统计时给这条目记下的「实际发送」tokens（列表里显示的那个数）。详情直接复用它，
+//     不重新分词 —— 详情与列表必须同一个数；
+//   · sentContent = 调用方已知的实际发送正文（「条目来源」子窗直接给）；缺省时按 anchorId 去快照里找；
+//   · anchorId = 当前统计视图对应锚点（消息下标或 'sim'），用于定位本次发送的上下文快照；
+//   · anchorAt = 该锚点统计的 at 时间戳。用于校验快照是否属于"当前这份统计"（防旧快照错配）。
 // 落点：由 layoutChildPair 统一决定（第二十四轮起：父窗原位、本窗开在它的另一侧）。
 // 第二十七轮：若本窗是从「条目来源」里点开的，则**同时保留第三窗**（条目来源的父窗，通常是完整上下文查看器），
 //   本窗落在条目来源的另一侧 → 「条目详情(左) | 条目来源(中) | 查看器(右)」。其它入口仍是两窗。
-async function openEntryDetailPopup({ book, name, uid, type }) {
+async function openEntryDetailPopup({ book, name, uid, type, tokens = null, sentContent = null, anchorId = null, anchorAt = null }) {
     const el = ensureEntryPopup();
     const bodyEl = document.getElementById('hide-entry-body');
     if (!bodyEl) return;
@@ -6166,11 +7154,35 @@ async function openEntryDetailPopup({ book, name, uid, type }) {
         return;
     }
     const { entry, uid: realUid } = found;
+    // 实际发送的正文 + 统计时给它记的 tokens：调用方直接给的优先；
+    // 否则按当前锚点去上下文快照里找（找不到就退回世界书原文，此时也没有"发送口径"的数字）。
+    const callerSentContent = (typeof sentContent === 'string' && sentContent.trim()) ? sentContent : null;
+    // 快照恢复（IndexedDB）是异步的：先等它合并进内存，避免刷新后首次点击误判"没有快照"。
+    if (callerSentContent === null && contextDumpHydration) {
+        try { await contextDumpHydration; } catch (e) { /* 忽略 */ }
+    }
+    const uidForLookup = [uid, realUid, entry.uid]
+        .find(v => v !== null && v !== undefined && v !== '') ?? null;
+    const fromDump = callerSentContent === null
+        ? findSentEntryContent({
+            book: book || entry.world || '',
+            name: entry.comment || name,
+            uid: uidForLookup,
+            anchorId,
+            anchorAt,
+        })
+        : null;
+    const actualSentContent = callerSentContent ?? (fromDump?.content || null);
+    // tokens 直接复用统计值：调用方给的 → 快照里存的；两者都没有（旧快照）才由 buildEntryDetailHtml 现算。
+    const sentTokens = Number.isFinite(Number(tokens)) ? Number(tokens) : (fromDump?.tokens ?? null);
     // uid 回退顺序：调用方给的（锚点记录/行属性）→ 世界书真实键
-    const built = await buildEntryDetailHtml(entry, type, { uid, uidFallback: realUid });
+    const built = await buildEntryDetailHtml(entry, type, { uid, uidFallback: realUid, sentContent: actualSentContent, sentTokens });
     if (seq !== entryPopupSeq) return; // 构建期间（含 token 统计等异步）又换了条目
     setEntryPopupHead({ name: entry.comment || name, book: book || entry.world || '', type: built.type });
     bodyEl.innerHTML = built.html;
+    // 正文块只显示字符（见 enforceTextOnlyContent）：即使第三方扩展尝试渲染 <img>/<cg-card> 也会被降级为文本
+    enforceTextOnlyContent(document.getElementById('hide-entry-content'));
+    bindEntrySourceToggle(bodyEl, built.sourceToggle);
     bodyEl.scrollTop = 0;
     positionEntryPopup();
 }
@@ -6208,8 +7220,7 @@ function ensureChatStatsPopup() {
     initHiddenScrollbar(el.querySelector('#hcs-body'));
     // Esc 关闭交给主弹窗那个统一处理器（keydown.hideHelperEsc）：它优先关"当前子窗"、只退一层。
     // **不再**点外部自动关闭：本子窗与父窗并排显示，点主窗是正常操作（切换锚点/查看条目），不应把它收掉。
-    const theme = extension_settings[extensionName]?.theme || 'light';
-    if (theme === 'dark') el.setAttribute('data-theme', 'dark');
+    applyThemeAttr(el);
     return el;
 }
 
@@ -6468,11 +7479,60 @@ async function openChatStatsPopup(model, anchorEl) {
 function notify(kind, msg) {
     try { toastr?.[kind]?.(msg); } catch (e) { /* 忽略：没有 toastr 就算了 */ }
 }
+
+// --- 上下文预算提醒 ---
+// 真实发送 / 模拟发送统计完成后调用：开启提醒且总量 ≥ 阈值时，弹一个自定义提示。
+// 阈值与统计页「总共」标红共用 getBudgetTokens()。
+function showBudgetWarning(totalTokens, limit) {
+    if (typeof document === 'undefined') return;
+    if (document.getElementById('hide-helper-budget-overlay')) return;
+    const overlay = document.createElement('div');
+    overlay.className = 'hide-modal-overlay hide-budget-overlay';
+    overlay.id = 'hide-helper-budget-overlay';
+    overlay.innerHTML = `
+        <div class="hide-modal-box hide-budget-box" role="alertdialog" aria-modal="true" aria-labelledby="hide-budget-title">
+            <div class="hide-modal-header hide-budget-header" id="hide-budget-title">
+                <i class="fa-solid fa-triangle-exclamation"></i> 上下文预算提醒
+            </div>
+            <div class="hide-budget-message">当前上下文为 <strong>${totalTokens}</strong> Tokens，已超出预算。</div>
+            <div class="hide-budget-sub">预算阈值：${limit} Tokens（可在「隐藏楼层」页调整）</div>
+            <div class="hide-modal-footer">
+                <button type="button" class="menu_button" id="hide-budget-open-helper">打开隐藏助手</button>
+                <button type="button" class="menu_button primary" id="hide-budget-ok">确认</button>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+    applyThemeAttr(overlay);
+    void overlay.offsetWidth;
+    overlay.classList.add('visible');
+    const close = () => {
+        overlay.classList.remove('visible');
+        setTimeout(() => overlay.remove(), 160);
+    };
+    overlay.querySelector('#hide-budget-ok')?.addEventListener('click', close);
+    overlay.querySelector('#hide-budget-open-helper')?.addEventListener('click', () => {
+        close();
+        extension_settings[extensionName].last_active_tab = 'hide-panel';
+        saveSettingsDebounced();
+        $('#hide-helper-wand-button').trigger('click');
+    });
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+}
+function maybeShowBudgetWarning(totalTokens) {
+    const s = extension_settings[extensionName];
+    if (!s?.budget_warning_enabled) return;
+    if (!isFeatureEnabled('stats')) return;
+    const n = Number(totalTokens);
+    if (!Number.isFinite(n)) return;
+    const limit = getBudgetTokens();
+    if (n < limit) return;
+    showBudgetWarning(n, limit);
+}
 // 背景（用户口径，2026-10-16）：「每次我需要手动查看效果时，都要重新生成一遍消息，以便显示"完整上下文"，
 //   这在现在的开发测试阶段非常麻烦。」→ 三条免重发的路子：
 //   ① `refreshContextSnapshot()`：用当前上下文**静默跑一次模拟发送**（= 点「模拟发送」但跳过输入弹窗），
 //      快照一落库就自动打开「完整上下文」查看器 —— 内容与真实发送一致（含世界书 / EJS 渲染），不消耗 token。
-//   ② `openLatestContextViewer()`：打开本聊天**最近一份**快照（配合 localStorage 持久副本，刷新页面也还在）。
+//   ② `openLatestContextViewer()`：打开本聊天**最近一份**快照（配合 IndexedDB 持久副本，刷新页面也还在）。
 //   ③ `makeDemoContextDump()`：塞一份**合成快照**并打开 —— 完全不跑管线、不需要任何发送，纯看 UI / 布局用。
 // 控制台入口：`hideHelperDev.snapshot()` / `.openViewer()` / `.demo()` / `.clear()`。
 function latestContextDumpFor(chatId) {
@@ -6484,7 +7544,9 @@ function latestContextDumpFor(chatId) {
     return best;
 }
 
-function openLatestContextViewer() {
+async function openLatestContextViewer() {
+    // 快照恢复是异步的（IndexedDB）：等它合并进内存再判断"有没有快照"
+    if (contextDumpHydration) { try { await contextDumpHydration; } catch (e) { /* 忽略 */ } }
     const chatId = getContext?.()?.chatId;
     const dump = latestContextDumpFor(chatId);
     if (!dump) {
@@ -6553,11 +7615,12 @@ function makeDemoContextDump() {
     return dump;
 }
 
-// 清空本地快照（内存 + localStorage）
+// 清空本地快照（内存 + IndexedDB）
 function clearContextDumps() {
     contextDumpStore.clear();
-    try { contextDumpStorage()?.removeItem(CONTEXT_DUMP_LS_KEY); } catch (e) { /* 忽略 */ }
-    notify('info', '已清空本地快照（内存 + localStorage）。');
+    void idbClearDumps();
+    try { localStorage.removeItem(CONTEXT_DUMP_LEGACY_LS_KEY); } catch (e) { /* 忽略 */ }
+    notify('info', '已清空本地快照（内存 + IndexedDB）。');
 }
 
 // 控制台 / Playwright 入口（免"重新生成消息"）
@@ -6570,7 +7633,7 @@ if (typeof window !== 'undefined') {
         latest: latestContextDumpFor,
     };
 }
-// ==================== 聊天统计 · 上下文快照（仅内存） ====================
+// ==================== 聊天统计 · 上下文快照（内存 + IndexedDB 副本） ====================
 // 数据来源：`contextDumpStore`（每次统计时写入的"实际发送的每条消息"快照），刷新/切聊天即清空。
 // 第二十九轮（用户口径①）：原来的**第一层「完整上下文」查看器**整体删除（"内容太过重复"），
 //   它的「筛选 / 检索 / 键盘导航」平移到「上下文目录」窗头部，「条目来源」子窗改由目录行打开；
@@ -6692,7 +7755,7 @@ function openCtxFilterMenu(triggerEl, { options = [], current = 'all', onPick } 
     const menu = document.createElement('div');
     menu.className = 'hh-menu';
     menu.setAttribute('role', 'menu');
-    if ((extension_settings[extensionName]?.theme || 'light') === 'dark') menu.setAttribute('data-theme', 'dark');
+    applyThemeAttr(menu);
     menu.innerHTML = options.map(([v, t]) =>
         `<button type="button" class="hh-menu-item${v === current ? ' active' : ''}" data-value="${escapeHtmlText(v)}">${escapeHtmlText(t)}</button>`).join('');
     document.body.appendChild(menu);          // 先入 DOM 才能量尺寸
@@ -7005,8 +8068,7 @@ function ensureWiMsgPopup() {
             },
         });
     });
-    const theme = extension_settings[extensionName]?.theme || 'light';
-    if (theme === 'dark') el.setAttribute('data-theme', 'dark');
+    applyThemeAttr(el);
     return el;
 }
 
@@ -7076,12 +8138,10 @@ function refreshWiMsgList() {
     const booksEl = document.getElementById('hwmp-book-filters');
     const books = [...new Set(entries.map(e => e.book))];
 
-    // 世界书筛选（用户口径：本子窗始终提供 tub-book-filters，便于切换不同世界书来源的条目）
+    // 世界书筛选（用户口径：本子窗始终提供 tub-book-filters，便于切换不同世界书来源的条目；
+    //   单书时只显示书名、不出现「所有条目」—— 与主面板同一套口径，见 buildBookFilterButtonsHtml）
     if (booksEl) {
-        booksEl.innerHTML = books.length
-            ? `<button class="tub-book-btn${wiMsgBookFilter === 'all' ? ' active' : ''}" data-book="all">所有条目</button>`
-                + books.map(b => `<button class="tub-book-btn${wiMsgBookFilter === b ? ' active' : ''}" data-book="${escapeHtmlText(b)}">${escapeHtmlText(b)}</button>`).join('')
-            : '';
+        booksEl.innerHTML = buildBookFilterButtonsHtml(books, wiMsgBookFilter);
         booksEl.querySelectorAll('.tub-book-btn').forEach(btn => {
             btn.onclick = () => {
                 wiMsgBookFilter = btn.getAttribute('data-book');
@@ -7136,6 +8196,7 @@ function refreshWiMsgList() {
     // 条目行：记录 → 可点击行（点击开条目详情子窗，与主面板一致）
     const records = rows.map(e => ({
         name: e.name, b: e.book, type: e.type, uid: e.uid, tokens: e.tokens,
+        content: e.content || '',   // 这条消息里实际命中的条目正文（供条目详情窗默认展示）
         matched: true, anchor: e.anchor || null, pos: e.pos ?? null,
         position: e.position ?? null, depth: e.depth ?? null, role: e.role ?? null, order: e.order ?? null,
     }));
@@ -7161,7 +8222,12 @@ function refreshWiMsgList() {
         });
         row.onclick = () => {
             const rec = wiMsgRowRecords.get(Number(row.getAttribute('data-rid'))) || null;
-            openEntryDetailPopup({ ...entry(), type: row.getAttribute('data-type'), tokens: rec ? rec.tokens : null });
+            openEntryDetailPopup({
+                ...entry(),
+                type: row.getAttribute('data-type'),
+                sentContent: rec?.content || null,   // 该消息里实际命中的条目正文
+                tokens: rec ? rec.tokens : null,     // 统计时给这段正文记的 tokens（详情直接复用）
+            });
         };
         // 第三十五轮用户口径⑪：行尾的「跳到正文」图标（`.tub-entry-jump`）已删除 —— 这里不再绑事件。
     });
@@ -7272,8 +8338,7 @@ function ensureContextOutlinePopup() {
         ctxHotkeysBound = true;
         document.addEventListener('keydown', handleContextHotkeys);
     }
-    const theme = extension_settings[extensionName]?.theme || 'light';
-    if (theme === 'dark') el.setAttribute('data-theme', 'dark');
+    applyThemeAttr(el);
     return el;
 }
 
@@ -7355,8 +8420,7 @@ function ensureContextMergedPopup() {
     // 内容区滚动 → 左侧目录跟着滚动/高亮（"目录 = 目录页"的双向联动；见 syncOutlineFromMergedScroll）
     el.querySelector('#hcm-body')?.addEventListener('scroll', scheduleOutlineSpy, { passive: true });
     bindContextMergedSearch(el);
-    const theme = extension_settings[extensionName]?.theme || 'light';
-    if (theme === 'dark') el.setAttribute('data-theme', 'dark');
+    applyThemeAttr(el);
     return el;
 }
 
@@ -7826,6 +8890,9 @@ function renderMergedContext() {
         return;
     }
     bodyEl.innerHTML = '<div class="hcm-text"></div>';
+    // 内容区只显示字符：第三方扩展若把文本节点渲染成元素，这里会立刻降级回纯文本。
+    // 白名单：PRE = 每条消息的内容块本身；MARK = 检索命中高亮。块内部的其它元素一律降级。
+    enforceTextOnlyContent(bodyEl.querySelector('.hcm-text'), ['PRE', 'MARK']);
     bodyEl.scrollTop = 0;
     const token = ctxMergedRenderToken;
     if (searchActive) {
@@ -8432,12 +9499,11 @@ function refreshOutlineEntryHighlight() {
 
 // ==================== 聊天统计功能结束 ====================
 
-// --- 更新日志弹窗 ---
-function createChangelogModalHtml(changelogText) {
+// --- 更新弹窗 ---
+function createUpdateModalHtml() {
     return `
     <div class="hide-modal-box" id="hide-helper-modal-update">
-        <div class="hide-modal-header">插件更新日志</div>
-        <div class="hide-changelog-viewer" id="hide-helper-changelog-content">${changelogText}</div>
+        <div class="hide-modal-header">插件更新</div>
         <div class="hide-update-tip">如果更新失败，可以在酒馆扩展页面的【管理扩展程序】列表中手动更新隐藏助手。如果依然更新失败，则可以尝试删除重装来使用最新版本插件。</div>
         <div class="hide-modal-footer">
             <button id="hide-helper-btn-confirm-update" class="menu_button primary">立即更新</button>
@@ -8446,20 +9512,12 @@ function createChangelogModalHtml(changelogText) {
     </div>`;
 }
 
-async function showUpdateModal() {
+function showUpdateModal() {
     const overlay = document.getElementById('hide-helper-modal-overlay');
     if (!overlay) return;
 
-    // 先显示 Loading
-    overlay.innerHTML = `<div class="hide-modal-box" style="text-align:center; padding:30px;">Loading changelog...</div>`;
+    overlay.innerHTML = createUpdateModalHtml();
     overlay.classList.add('visible');
-
-    const changelog = await getChangelog();
-
-    // 简单的 Markdown 转义处理
-    const safeLog = changelog.replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
-    overlay.innerHTML = createChangelogModalHtml(safeLog);
 
     const btnUpdate = document.getElementById('hide-helper-btn-confirm-update');
     if (btnUpdate) {
@@ -8483,6 +9541,346 @@ async function showUpdateModal() {
             }
         };
     }
+}
+
+// --- 「隐藏助手」图文使用说明弹窗（隐藏楼层 / 限制楼层 / 聊天统计 三个标签页） ---
+// 截图放在 ./guide/ 下；<img width/height> 按实际显示尺寸写（2x 截图按一半宽）。
+// 入口：使用说明页 → 「查看图文使用说明」按钮。
+// 说明：HTML 只在用户点开的那一刻拼出来，图片随之加载；插件启动时没有额外开销。
+const GUIDE_TABS = [
+    { id: 'hide', label: '隐藏楼层', icon: 'mes_ghost fa-solid fa-ghost' },
+    { id: 'limiter', label: '限制楼层', icon: 'fa-solid fa-layer-group' },
+    { id: 'stats', label: '聊天统计', icon: 'fa-solid fa-chart-pie' },
+];
+
+function statsGuideImgUrl(name) {
+    return new URL('./guide/' + name, import.meta.url).href;
+}
+
+function guideFigure(src, w, h, caption, alt) {
+    const cap = caption ? `<figcaption class="hh-guide-cap">${caption}</figcaption>` : '';
+    return `<figure class="hh-guide-fig">
+        <img class="hh-guide-img" width="${w}" height="${h}" src="${statsGuideImgUrl(src)}" alt="${alt || ''}">
+        ${cap}
+    </figure>`;
+}
+
+function guideAnnotFigure(src, w, h, marks, caption, alt) {
+    const badges = (marks || []).map((m) => {
+        if (m.w !== undefined && m.h !== undefined) {
+            const below = m.labelBelow ?? (m.y < 10);
+            const label = m.label
+                ? `<span class="hh-guide-hit-label${below ? ' is-below' : ''}">${m.label}</span>`
+                : '';
+            return `<span class="hh-guide-hit" style="left:${m.x}%;top:${m.y}%;width:${m.w}%;height:${m.h}%">${label}</span>`;
+        }
+        return `<span class="hh-guide-mark" style="left:${m.x}%;top:${m.y}%">${m.n}</span>`;
+    }).join('');
+    const cap = caption ? `<figcaption class="hh-guide-cap">${caption}</figcaption>` : '';
+    return `<figure class="hh-guide-fig hh-guide-annot-fig" style="width:${w}px">
+        <span class="hh-guide-annot">
+            <img class="hh-guide-img" width="${w}" height="${h}" src="${statsGuideImgUrl(src)}" alt="${alt || ''}">
+            ${badges}
+        </span>
+        ${cap}
+    </figure>`;
+}
+
+function createStatsGuideModalHtml() {
+    const fig = guideFigure;
+    const annot = guideAnnotFigure;
+    const tabs = GUIDE_TABS.map((t, i) =>
+        `<button type="button" class="hh-guide-tab${i === 0 ? ' active' : ''}" data-guide-tab="${t.id}">
+            <i class="${t.icon}"></i>${t.label}
+        </button>`).join('');
+    return `
+    <div class="hide-modal-box hh-guide-box" id="hh-guide-box">
+        <div class="hh-guide-head">
+            <div class="hh-guide-title"><i class="fa-solid fa-book-open"></i> 图文使用说明</div>
+            <button type="button" class="hh-guide-close" id="hh-guide-close" title="关闭">&times;</button>
+        </div>
+        <div class="hh-guide-tabs" id="hh-guide-tabs">${tabs}</div>
+        <div class="hh-guide-body" id="hh-guide-body">
+
+            <div class="hh-guide-tab-panel" data-guide-tab="hide">
+                <div class="hh-guide-lead">
+                    隐藏楼层的核心只有一句：<strong>把「最近 N 楼」以前的旧楼层从发送给 AI 的上下文里截掉</strong>。
+                    消息本身不删、界面也照常显示，所以它是「发送层」的截断，而不是「删除」。
+                </div>
+
+                <section class="hh-guide-sec">
+                    <h3><span class="hh-guide-step">1</span>原理：只改「发送」，不改「显示」</h3>
+                    ${fig('g-hide-logic.png', 600, 300, '旧楼层被截断，只有最近 N 楼进入上下文', '隐藏楼层原理示意')}
+                    <ul class="hh-guide-list">
+                        <li><strong>实时隐藏：</strong>最终发送的提示词聊天只有最近N楼。</li>
+                        <li><strong>消息仍在、界面照旧：</strong>被隐藏的楼层依然能在聊天里看到、滚动、编辑，只是名字旁多一个<strong>👻幽灵标记</strong>。</li>
+                    </ul>
+                </section>
+
+                <section class="hh-guide-sec">
+                    <h3><span class="hh-guide-step">2</span>面板：五个核心设置</h3>
+                    ${fig('g-hide-panel.png', 378, 459, '隐藏楼层面板（截图里设的是保留 3 楼、角色模式）', '隐藏楼层面板与设置项')}
+                    <ul class="hh-guide-list">
+                        <li><strong>① 总开关：</strong>关掉后插件不再自动隐藏任何楼层；已经隐藏的楼层不会自动恢复，需要点 ⑤。</li>
+                        <li><strong>② 保留最新 N 条：</strong>N 是「要保留几楼」。填 3 → 只发最近 3 楼，更早的全部隐藏。</li>
+                        <li><strong>③ 当前生效值：</strong>本聊天现在实际保留几楼，改完立即刷新，不用重开面板。</li>
+                        <li><strong>④ 全局模式开关：</strong>开 = 所有角色卡聊天共用一套设置；关 = <strong>角色模式</strong>，设置只对当前角色卡生效（换角色自动切回该角色自己的设置）。</li>
+                        <li><strong>⑤ 一键取消隐藏：</strong>立刻把本聊天所有楼层恢复为可见状态，用于误设 N 之后回滚。</li>
+                    </ul>
+                    <p class="hh-gs-tip">面板下方还有新增的「上下文预算提醒」，见下一步。</p>
+                </section>
+
+                <section class="hh-guide-sec">
+                    <h3><span class="hh-guide-step">3</span>上下文预算提醒（新）</h3>
+                    <div class="hh-gs-flow">
+                        <div class="hh-gs-flow-head">
+                            <div class="hh-gs-flow-title"><span class="hh-gs-badge">新</span>提前知道这一轮上下文是否超出预算</div>
+                            <div class="hh-gs-flow-path">隐藏楼层页 → 开启提醒并设置阈值 → 超预算时弹窗</div>
+                        </div>
+                        <div class="hh-gs-flow-row">
+                            <div class="hh-gs-step">
+                                <div class="hh-gs-step-label">设置</div>
+                                <div class="hh-gs-card">
+                                    <div class="hh-gs-budget-line"><span>上下文预算提醒</span><span class="hh-gs-budget-switch">开</span></div>
+                                    <div class="hh-gs-budget-line"><span>预算阈值</span><strong>400000 tokens</strong></div>
+                                    <p class="hh-gs-step-note">位置：隐藏楼层页「保留最新 N 条」下方。</p>
+                                </div>
+                            </div>
+                            <div class="hh-gs-flow-arrow" aria-hidden="true">→</div>
+                            <div class="hh-gs-step">
+                                <div class="hh-gs-step-label">提醒</div>
+                                <div class="hh-gs-card">
+                                    <div class="hh-gs-budget-warning-title"><i class="fa-solid fa-triangle-exclamation"></i> 上下文预算提醒</div>
+                                    <p class="hh-gs-budget-warning-text">当前上下文为 <strong>512000</strong> Tokens，已超出预算。</p>
+                                    <p class="hh-gs-step-note">预算阈值：400000 Tokens（可在「隐藏楼层」页调整）</p>
+                                    <div class="hh-gs-budget-actions">
+                                        <span class="hh-gs-budget-btn">打开隐藏助手</span>
+                                        <span class="hh-gs-budget-btn hh-gs-budget-btn-primary">确认</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <ul class="hh-guide-list">
+                        <li><strong>它只是提醒：</strong>不会自动隐藏楼层，也不会拦截或缩短本次发送；要真正减少上下文，请调小保留楼层 N。</li>
+                        <li><strong>依赖聊天统计：</strong>开启提醒会同时启用聊天统计；关闭聊天统计时，提醒也会关闭。</li>
+                        <li><strong>阈值同时标红：</strong>统计页「总共」达到该阈值时会变红，方便快速判断。</li>
+                        <li><strong>弹窗按钮：</strong>「打开隐藏助手」会直接打开插件并切到「隐藏楼层」页，方便调整 N 或阈值；「确认」只关闭提醒。</li>
+                    </ul>
+                </section>
+
+                <section class="hh-guide-sec">
+                    <h3><span class="hh-guide-step">4</span>设置之后，聊天界面会变成什么样</h3>
+                    ${fig('g-hide-chat.png', 525, 359, '被隐藏的楼层还在，但多了幽灵标记；它不会进入本次发送', '被隐藏的楼层与幽灵标记')}
+                    <ul class="hh-guide-list">
+                        <li><strong>幽灵标记 = 已隐藏：</strong>看到它就说明这一楼不会被发送给 AI，不是数据损坏。</li>
+                        <li><strong>上下文核对：</strong>想知道这一轮到底发了什么，切到「聊天统计」页看「实际发送范围」，与这里对照。</li>
+                        <li><strong>与正则/其它自动隐藏插件冲突：</strong>如果同时使用了别的含有自动隐藏插件（例如柏宝书/小白X剧情总结功能），建议禁用隐藏助手的【隐藏楼层】功能或者删除隐藏助手。</li>
+                    </ul>
+                </section>
+            </div>
+
+            <div class="hh-guide-tab-panel" data-guide-tab="limiter" hidden>
+                <div class="hh-guide-lead">
+                    限制楼层解决的是<strong>卡顿</strong>：它只改「聊天界面渲染多少条消息」，不改「发送给 AI 多少内容」。
+                    所以它能救流畅度，但<strong>不省 token</strong>。
+                </div>
+
+                <section class="hh-guide-sec">
+                    <h3><span class="hh-guide-step">1</span>原理：只改「界面渲染多少条」</h3>
+                    ${fig('g-lim-logic.png', 600, 280, '界面少画一些，上下文照旧全量', '限制楼层原理示意')}
+                    <ul class="hh-guide-list">
+                        <li><strong>它不是发送开关：</strong>没被渲染的楼层仍然在上下文里（除非被「隐藏楼层」隐藏）。</li>
+                        <li><strong>同一个接口：</strong>它实际调用的就是酒馆原生的「要渲染 # 条消息」，所以与酒馆、酒馆助手、鸡尾酒插件的「限制消息加载/渲染」不会冲突。</li>
+                        <li><strong>为什么有用：</strong>超长聊天一次渲染上千条消息会明显卡顿；只渲染最近 N 条后，滚动、切楼层都更顺。</li>
+                    </ul>
+                </section>
+
+                <section class="hh-guide-sec">
+                    <h3><span class="hh-guide-step">2</span>面板：两个设置</h3>
+                    ${fig('g-lim-panel.png', 378, 384, '限制楼层面板（截图里设的是 20 条）', '限制楼层面板')}
+                    <ul class="hh-guide-list">
+                        <li><strong>① 总开关：</strong>关掉后不再限制，界面恢复渲染全部消息。</li>
+                        <li><strong>② 加载的消息楼层数量：</strong>界面只渲染最近 N 条，建议不超过 20；填 <code>0</code> 表示不限制。</li>
+                        <li>这个数值与酒馆「用户设置 → 要渲染 # 条消息」<strong>双向同步</strong>，在哪边改都一样。</li>
+                        <li>改动后会重新加载当前聊天，界面会闪一下，属正常现象。</li>
+                    </ul>
+                </section>
+
+                <section class="hh-guide-sec">
+                    <h3><span class="hh-guide-step">3</span>界面上的表现</h3>
+                    ${fig('g-lim-chat.png', 528, 338, '顶部出现 Show more messages，往上翻可以逐段加载更早的楼层', '限制楼层后的聊天界面')}
+                    <ul class="hh-guide-list">
+                        <li><strong>Show more messages：</strong>点一下往上加载更早的楼层，只影响界面，不改变发送内容。</li>
+                        <li><strong>只省性能：</strong>渲染条数少了，滚动和内存压力就小；token 消耗不变。</li>
+                    </ul>
+                </section>
+            </div>
+
+            <div class="hh-guide-tab-panel" data-guide-tab="stats" hidden>
+                <div class="hh-guide-lead">
+                    聊天统计会在每次实际发送后，记录这一轮的 token 构成：聊天 / 世界书 / 其他各占多少，世界书具体注入了哪些条目，并把记录锚定到对应楼层。
+                </div>
+
+                <section class="hh-guide-sec">
+                    <h3><span class="hh-guide-step">1</span>三种查看方式</h3>
+                    <p class="hh-gs-lead">
+                        每个按钮对应一组独立窗口，分别隔开看；从左到右，手机端自动改为从上到下。
+                    </p>
+
+                    <div class="hh-gs-flow">
+                        <div class="hh-gs-flow-head">
+                            <div class="hh-gs-flow-title"><span class="hh-gs-badge">A</span>查看这一轮实际发送的完整上下文与条目来源</div>
+                            <div class="hh-gs-flow-path">总共 → 上下文目录 / 完整上下文 → 条目来源（条目详情）</div>
+                        </div>
+                        <div class="hh-gs-flow-row">
+                            <div class="hh-gs-step">
+                                <div class="hh-gs-step-label">父弹窗</div>
+                                ${annot('g-stats-main.png', 240, 325, [
+                                    { x: 7.5, y: 30, w: 23, h: 12, label: '点总共', labelBelow: true },
+                                ], '', '聊天统计主页面')}
+                                <p class="hh-gs-step-note">点「总共」卡。</p>
+                            </div>
+                            <div class="hh-gs-flow-arrow" aria-hidden="true">→</div>
+                            <div class="hh-gs-step">
+                                <div class="hh-gs-step-label">子弹窗</div>
+                                ${annot('g-stats-context-pair.png', 300, 173, [
+                                    { x: 6, y: 36.5, w: 12, h: 7.5, label: '点行首方块' },
+                                ], '左边目录、右边实际发送全文，两窗成对打开/关闭。', '上下文目录与完整上下文')}
+                                <p class="hh-gs-step-note">在目录里点世界书消息行首的彩色小方块。</p>
+                            </div>
+                            <div class="hh-gs-flow-arrow" aria-hidden="true">→</div>
+                            <div class="hh-gs-step">
+                                <div class="hh-gs-step-label">孙弹窗</div>
+                                ${fig('g-stats-entry-source.png', 220, 250, '这条世界书消息由哪些条目组成，以及各自占用的 token。', '条目来源')}
+                                <p class="hh-gs-step-note">条目来源（条目详情），到此结束。</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="hh-gs-flow">
+                        <div class="hh-gs-flow-head">
+                            <div class="hh-gs-flow-title"><span class="hh-gs-badge">B</span>查看聊天部分的 token 与生成速度</div>
+                            <div class="hh-gs-flow-path">聊天 → 聊天统计详情</div>
+                        </div>
+                        <div class="hh-gs-flow-row">
+                            <div class="hh-gs-step">
+                                <div class="hh-gs-step-label">父弹窗</div>
+                                ${annot('g-stats-main.png', 240, 325, [
+                                    { x: 31.5, y: 30, w: 23, h: 12, label: '点聊天', labelBelow: true },
+                                ], '', '聊天统计主页面')}
+                                <p class="hh-gs-step-note">点「聊天」卡。</p>
+                            </div>
+                            <div class="hh-gs-flow-arrow" aria-hidden="true">→</div>
+                            <div class="hh-gs-step">
+                                <div class="hh-gs-step-label">子弹窗</div>
+                                ${fig('12-stats-detail.png', 240, 328, '实际发送范围、AI 平均 tokens / 生成速度，以及最近几条 AI 消息的折线。', '聊天统计详情')}
+                                <p class="hh-gs-step-note">到此结束，没有孙弹窗。</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="hh-gs-flow">
+                        <div class="hh-gs-flow-head">
+                            <div class="hh-gs-flow-title"><span class="hh-gs-badge">C</span>查看单个世界书条目的实际内容</div>
+                            <div class="hh-gs-flow-path">条目行 → 世界书条目详情</div>
+                        </div>
+                        <div class="hh-gs-flow-row">
+                            <div class="hh-gs-step">
+                                <div class="hh-gs-step-label">父弹窗</div>
+                                ${annot('g-stats-main.png', 240, 325, [
+                                    { x: 4, y: 69, w: 92, h: 13, label: '点条目行' },
+                                ], '', '聊天统计主页面')}
+                                <p class="hh-gs-step-note">在「已激活条目」里点任意一行。</p>
+                            </div>
+                            <div class="hh-gs-flow-arrow" aria-hidden="true">→</div>
+                            <div class="hh-gs-step">
+                                <div class="hh-gs-step-label">子弹窗</div>
+                                ${fig('07-entry-detail.png', 240, 328, '默认显示实际发送内容；点 tokens 左侧图标可切回原条目。', '世界书条目详情')}
+                                <p class="hh-gs-step-note">到此结束，没有孙弹窗。</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <p class="hh-gs-tip">「总共」「聊天」两张卡也可以从锚点栏右侧的两个小图标打开，效果一样。</p>
+                </section>
+
+                <section class="hh-guide-sec">
+                    <h3><span class="hh-guide-step">2</span>对比与模拟发送</h3>
+                    <div class="hh-gs-cards">
+                        <div class="hh-gs-card">
+                            ${fig('g-stats-compare.png', 300, 439, '选两个楼层做基准 / 对比；红字是差值，只看有变化的条目。', '两锚点对比视图')}
+                        </div>
+                        <div class="hh-gs-card">
+                            ${fig('10-sim-menu.png', 156, 180, '模拟发送：真实组装一次并在发往 API 前拦截，不耗 token、不新增消息。', '模拟发送菜单项')}
+                        </div>
+                    </div>
+                    <p class="hh-gs-tip">「对比」是主页面内的视图切换，不是新窗口；「模拟发送」是锚点菜单里的动作项。</p>
+                </section>
+
+                <div class="hh-gs-chips">
+                    <span class="hh-gs-chip">统计口径 = 实际发送</span>
+                    <span class="hh-gs-chip">锚点只保留最近 2 条</span>
+                    <span class="hh-gs-chip">总共 ≥ 400000 变红</span>
+                    <span class="hh-gs-chip">模拟锚点只在内存</span>
+                </div>
+            </div>
+
+        </div>
+    </div>`;
+}
+
+let statsGuideKeyHandler = null;
+
+function switchStatsGuideTab(tabId) {
+    const box = document.getElementById('hh-guide-box');
+    if (!box) return;
+    box.querySelectorAll('.hh-guide-tab').forEach(b => {
+        b.classList.toggle('active', b.dataset.guideTab === tabId);
+    });
+    box.querySelectorAll('.hh-guide-tab-panel').forEach(p => {
+        p.hidden = p.dataset.guideTab !== tabId;
+    });
+    const body = document.getElementById('hh-guide-body');
+    if (body) body.scrollTop = 0;
+}
+
+function closeStatsGuideModal() {
+    const overlay = document.getElementById('hide-helper-modal-overlay');
+    if (!overlay) return;
+    overlay.classList.remove('visible');
+    overlay.onclick = null;
+    overlay.innerHTML = '';
+    if (statsGuideKeyHandler) {
+        document.removeEventListener('keydown', statsGuideKeyHandler);
+        statsGuideKeyHandler = null;
+    }
+}
+
+function openStatsGuideModal() {
+    const overlay = document.getElementById('hide-helper-modal-overlay');
+    if (!overlay) return;
+    overlay.innerHTML = createStatsGuideModalHtml();
+    overlay.classList.add('visible');
+    const body = document.getElementById('hh-guide-body');
+    if (body) body.scrollTop = 0;
+    const box = document.getElementById('hh-guide-box');
+    if (box) {
+        box.addEventListener('click', (e) => {
+            const tabBtn = e.target.closest('.hh-guide-tab');
+            if (tabBtn) switchStatsGuideTab(tabBtn.dataset.guideTab);
+        });
+    }
+    // 点遮罩空白处关闭（点内容不关）
+    overlay.onclick = (e) => { if (e.target === overlay) closeStatsGuideModal(); };
+    document.getElementById('hh-guide-close')?.addEventListener('click', closeStatsGuideModal);
+    statsGuideKeyHandler = (e) => {
+        if (e.key === 'Escape') {
+            e.stopPropagation();
+            closeStatsGuideModal();
+        }
+    };
+    document.addEventListener('keydown', statsGuideKeyHandler);
 }
 
 /**
@@ -8618,14 +10016,14 @@ function setupEventListeners() {
     if (event_types.GENERATION_ENDED) {
         eventSource.on(event_types.GENERATION_ENDED, () => {
             pendingGenType = null;
-            // normal 的锚定挂在"等待 AI 回复"上：此刻回复应已追加 → 补写；仍未到则回退到触发消息
+            // normal 的锚定挂在"等待 AI 回复"上：此刻回复应已追加 → 补写；仍未到则丢弃（绝不回退到触发消息）
             flushPendingReplyAnchor('generation-ended', true);
         });
     }
     if (event_types.GENERATION_STOPPED) {
         eventSource.on(event_types.GENERATION_STOPPED, () => {
             pendingGenType = null;
-            // 被用户中止：可能没有回复 → 回退写到触发消息上，统计不丢
+            // 被用户中止：若确实没有产生回复 → 丢弃本次统计（绝不把统计写到预置的触发楼层上）
             flushPendingReplyAnchor('generation-stopped', true);
         });
     }
@@ -8634,7 +10032,7 @@ function setupEventListeners() {
         eventSource.on(event_types.MESSAGE_RECEIVED, () => { flushPendingReplyAnchor('message-received', false); });
     }
     // 超时兜底：事件顺序异常（既没有结束事件也没有新消息）时不让统计永久挂起。
-    // ⚠️ 生成中（`body.dataset.generating`）跳过——慢速回复可能要几十秒，绝不能提前回退到触发消息。
+    // ⚠️ 生成中（`body.dataset.generating`）跳过——慢速回复可能要几十秒，不能提前把挂起的锚定当成"没有回复"丢掉。
     setInterval(() => {
         if (!pendingReplyAnchor) return;
         if (document.body?.dataset?.generating === 'true') return;
@@ -8691,6 +10089,8 @@ function setupEventListeners() {
             // 统计是异步做的，期间顺序可能已被改动。
             const simPromptOrder = capturePromptOrderSnapshot(simGenType);
             // 串行队列（P4-6）：统计一次只跑一个；若上一轮未完成则排队等待（不再静默丢弃）。
+            const waitCtl = simulateStatsWait;
+            if (waitCtl) waitCtl.queued = true;
             enqueueStatsJob({
                 label: `模拟发送（${simMessages.length} 条消息）`,
                 run: async () => {
@@ -8710,14 +10110,17 @@ function setupEventListeners() {
                     }
                     stats.genType = 'simulate';
                     simulateAnchor = stats;
-                    // 完整上下文快照（仅内存）：模拟锚定用哨兵 id 入库
+                    // 完整上下文快照（内存 + IndexedDB 副本）：模拟锚定用哨兵 id 入库
                     saveContextDump(simChatIdNow, SIM_ANCHOR_ID, 'simulate', lastContextDump);
                     statsViewMode = 'detail';
                     statsPinnedIndex = null;
                     Logger.debug(`【模拟发送】临时锚定：总计 ${stats.total}（聊天 ${stats.chat} / 世界书 ${stats.wi}）`);
                     updateTokenStatsUI();
+                    maybeShowBudgetWarning(stats.total);
                 },
                 onError: (err) => Logger.warn('模拟发送统计失败:', err),
+                // 统计任务真正结束（成功 / 失败 / 排队超限被丢弃）才放行进度弹窗
+                onSettled: () => waitCtl?.resolve?.(),
             });
             return;
         }
@@ -8786,6 +10189,7 @@ function setupEventListeners() {
                 if (!writeAnchoredStats(anchor, stats, dump)) return;
                 Logger.debug(`【最终上下文】锚定到消息 #${anchor.index}（${genType}）：总计 ${stats.total}（聊天 ${stats.chat} / 世界书 ${stats.wi}）`);
                 updateTokenStatsUI();
+                maybeShowBudgetWarning(stats.total);
             },
             onError: (err) => Logger.warn('统计最终上下文失败:', err),
         });
@@ -8805,7 +10209,7 @@ function setupEventListeners() {
     // 主弹窗重排的补帧句柄：键盘动画期间视口会连改几帧，事件回调可能落在中间态
     let mainPopupSettleRaf = 0;
 
-    $('#hide-helper-wand-button').on('click', function() {
+    function openMainPopup() {
         Logger.debug('魔杖按钮被点击');
         if (!extension_settings[extensionName]?.enabled) {
             Logger.debug('插件已禁用');
@@ -8813,6 +10217,7 @@ function setupEventListeners() {
             return;
         }
         Logger.debug('插件已启用，更新显示后显示弹窗');
+        hideFloatingBall();
         updateCurrentHideSettingsDisplay();
 
         // 首次打开时显示红色括号说明提示
@@ -8840,14 +10245,15 @@ function setupEventListeners() {
         $('.tab-panel').removeClass('active');
         $(`.tab-panel[data-tab="${lastActiveTab}"]`).addClass('active');
 
-        // ---- 【打开弹窗渲染统计】 ----
-        // 直接读取消息上锚定的统计数据（上次实际发送时记录的），无任何副作用。
-        updateTokenStatsUI();
-
         const $popup = $('#hide-helper-popup');
         const $backdrop = $('#hide-helper-backdrop');
         $backdrop.show();
         $popup.show();
+        // ---- 【打开弹窗渲染统计】 ----
+        // 先显示再渲染：锚定栏的「明细 / 对比」滑块要在可见状态下测量宽度，
+        // 隐藏时 getBoundingClientRect() 为 0，滑块会停在宽度 0（首次打开看不到当前按钮底色）。
+        // 直接读取消息上锚定的统计数据（上次实际发送时记录的），无任何副作用。
+        updateTokenStatsUI();
         centerPopup($popup);
         updateTabIndicator(); // 弹窗显示后再测量，定位滑动下划线
         requestAnimationFrame(() => updateTabIndicator()); // 布局稳定后再校正一次
@@ -8906,14 +10312,111 @@ function setupEventListeners() {
             $('#hide-helper-download-log').hide();
         }
 
-        // 显示主题提示弹窗（如果是首次打开）
-        if (!extension_settings[extensionName].theme_notification_viewed) {
+        // 显示新版主题/背景提示弹窗（只显示一次）
+        if (!extension_settings[extensionName].theme_notification_viewed_v2) {
             showThemeNotification();
         }
+    }
+
+    $('#hide-helper-wand-button').on('click', openMainPopup);
+
+    // --- 悬浮球：点它 / 回车 / 空格 → 打开面板（拖拽逻辑见 bindFabDrag） ---
+    $(document).off('click.hideHelperFab').on('click.hideHelperFab', `#${FAB_ID}`, function(e) {
+        e.stopPropagation();
+        $('#hide-helper-wand-button').trigger('click');
+        if ($('#hide-helper-popup').is(':visible')) hideFloatingBall();
+    });
+    $(document).off('keydown.hideHelperFab').on('keydown.hideHelperFab', `#${FAB_ID}`, function(e) {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        e.preventDefault();
+        e.stopPropagation();
+        $(`#${FAB_ID}`).trigger('click');
+    });
+
+    // --- 「-」收为悬浮球 & 首次说明 ---
+    function minimizeToFloatingBall() {
+        const s = extension_settings[extensionName];
+        if (!s) return;
+        s.floating_ball = true;
+        saveSettingsDebounced();
+        closePopup();
+    }
+
+    const BALL_HINT_TEXTS = {
+        enter: '点击该 - 按钮会将隐藏助手变为悬浮球状态，而点击 X 按钮则可以退出悬浮球状态并关闭面板。',
+        exit: '已退出悬浮球状态。再次点击 - 按钮会将隐藏助手重新变为悬浮球状态。',
+    };
+
+    function ensureBallIntro(kind = 'enter') {
+        let el = document.getElementById('hide-helper-ball-intro');
+        if (el) {
+            if (el.dataset.hintKind === kind) return el;
+            el.remove();
+        }
+        const text = BALL_HINT_TEXTS[kind] || BALL_HINT_TEXTS.enter;
+        const introHtml = `
+            <div id="hide-helper-ball-intro" class="hide-helper-notification-popup hide-helper-ball-intro" data-hint-kind="${kind}">
+                <div class="notification-content">
+                    <p>${text}</p>
+                    <div class="notification-confirm-row">
+                        <button type="button" id="hide-helper-ball-intro-confirm" class="hide-helper-btn notification-action-btn notification-primary-btn hide-helper-ball-intro-confirm">不再显示该弹窗</button>
+                    </div>
+                </div>
+            </div>`;
+        $('body').append(introHtml);
+        el = document.getElementById('hide-helper-ball-intro');
+        applyThemeAttr(el);
+        return el;
+    }
+
+    function showBallIntro(kind = 'enter') {
+        const el = ensureBallIntro(kind);
+        applyThemeAttr(el);
+        $(el).show();
+        centerPopup($(el));
+        $(window).off('resize.hideHelperBallIntro').on('resize.hideHelperBallIntro', () => centerPopup($(el)));
+    }
+
+    function closeBallIntro() {
+        const el = document.getElementById('hide-helper-ball-intro');
+        if (!el) return;
+        $(window).off('resize.hideHelperBallIntro');
+        el.remove();
+    }
+
+    function maybeShowBallExitIntro() {
+        const s = extension_settings[extensionName];
+        if (!s || s.floating_ball_exit_intro_viewed) return;
+        // 展示即视为已看过：点按钮或刷新后都不再出现
+        s.floating_ball_exit_intro_viewed = true;
+        saveSettingsDebounced();
+        showBallIntro('exit');
+    }
+
+    $('#hide-helper-popup-minimize-icon').on('click', function() {
+        const s = extension_settings[extensionName];
+        if (!s) return;
+        // 首次点击：面板保持打开并显示说明；「已看过」立即落盘，刷新后不再出现
+        if (!s.floating_ball_intro_viewed) {
+            s.floating_ball_intro_viewed = true;
+            // 先记下悬浮球模式：即使不点按钮直接刷新，也会恢复为悬浮球
+            s.floating_ball = true;
+            saveSettingsDebounced();
+            showBallIntro('enter');
+            return;
+        }
+        minimizeToFloatingBall();
+    });
+
+    $(document).off('click.hideHelperBallIntro').on('click.hideHelperBallIntro', '#hide-helper-ball-intro-confirm', function() {
+        const el = document.getElementById('hide-helper-ball-intro');
+        const kind = el?.dataset.hintKind || 'enter';
+        closeBallIntro();
+        if (kind === 'enter') minimizeToFloatingBall();
     });
 
     // 关闭弹窗的统一处理函数
-    function closePopup() {
+    function closePopup({ exitFloatingBall = false } = {}) {
         Logger.debug('');
         Logger.debug('🚪🚪🚪【关闭弹窗】开始 🚪🚪🚪');
         closeTypeFilterMenu(); // 关弹窗时一并收起类型过滤菜单（它挂在弹窗直下，不随面板重绘消失）
@@ -8956,6 +10459,8 @@ function setupEventListeners() {
         $('#hide-helper-popup').hide();
         $('#hide-helper-backdrop').hide();
         closeEntryPopup(); // 条目详情子弹窗随主弹窗一并关闭
+        closeThemeNotification(); // 新版提示弹窗随主弹窗一并关闭
+        closeBallIntro(); // 悬浮球首次说明随主弹窗一并关闭
         closeChildStack(); // 主弹窗关闭 = **重置**：整轮层级结束
         // 取消尚未执行的「补帧落位」，避免回调打到已关闭的弹窗上
         if (mainPopupSettleRaf) {
@@ -8967,6 +10472,20 @@ function setupEventListeners() {
             $(window.visualViewport).off('resize.hideHelperMain scroll.hideHelperMain');
         }
 
+        // X = 退出悬浮球状态；其它关闭方式若仍处于悬浮球模式，则回到悬浮球
+        if (exitFloatingBall) {
+            const wasBallMode = isFloatingBallEnabled();
+            const wasBallShown = floatingBallShown;
+            if (wasBallMode) setFloatingBallEnabled(false);
+            else hideFloatingBall();
+            floatingBallShown = false;
+            if (wasBallMode && wasBallShown) maybeShowBallExitIntro();
+        } else if (isFloatingBallEnabled()) {
+            showFloatingBall();
+        } else {
+            hideFloatingBall();
+        }
+
         Logger.debug(`【关闭弹窗】✅ 弹窗已关闭`);
         Logger.debug('🚪🚪🚪【关闭弹窗】结束🚪🚪🚪');
         Logger.debug('');
@@ -8974,7 +10493,7 @@ function setupEventListeners() {
 
     $('#hide-helper-popup-close-icon').on('click', function() {
         Logger.debug('【事件】点击弹窗关闭图标');
-        closePopup();
+        closePopup({ exitFloatingBall: true });
     });
 
     // 点击遮罩层关闭弹窗
@@ -8986,6 +10505,11 @@ function setupEventListeners() {
     // 新增: ESC键快速关闭弹窗
     $(document).off('keydown.hideHelperEsc').on('keydown.hideHelperEsc', function(e) {
         if (e.key !== 'Escape') return;
+        // 首次说明浮层优先关闭，避免 ESC 一下把整个面板连带关掉
+        if ($('#hide-helper-ball-intro').is(':visible')) {
+            closeBallIntro();
+            return;
+        }
         // 有子窗开着 → 只关**当前窗**（退一层，父窗留在屏幕上；第二十四轮的"父窗原位"模型下这才符合直觉）；
         // 没有子窗时才关主弹窗。
         if (currentChildId()) {
@@ -9000,9 +10524,11 @@ function setupEventListeners() {
     });
 
     // --- 主题切换事件 ---
-    $(document).on('click', '#hide-helper-theme-toggle', function() {
-        const currentTheme = extension_settings[extensionName].theme || 'light';
-        const newTheme = currentTheme === 'light' ? 'dark' : 'light';
+    // 三套主题循环切换：亮色 → 暗色 → Galgame → 亮色
+    // 使用说明页与提示弹窗共用同一个处理器
+    $(document).on('click', '#hide-helper-theme-toggle, #hide-helper-notification-theme-toggle', function() {
+        const cur = currentTheme();
+        const newTheme = HH_THEMES[(HH_THEMES.indexOf(cur) + 1) % HH_THEMES.length] || 'light';
 
         // 水波纹切换：从弹窗左下角扩散到右上角
         applyThemeWithRipple(newTheme, {
@@ -9013,6 +10539,56 @@ function setupEventListeners() {
                 }
             },
         });
+    });
+
+    // --- 背景图片设置（所有主题通用）---
+    // 提示弹窗里的按钮要把菜单挂到提示弹窗自己身上，否则会挂到主弹窗并算错位置
+    $(document).on('click', '#hide-helper-bg-image-select, #hide-helper-notification-bg-select', function() {
+        const trigger = this;
+        if (openTypeMenuTrigger === trigger) { closeTypeFilterMenu(); return; }
+        const host = trigger.closest('.hide-helper-notification-popup') || null;
+        openTypeFilterMenu(trigger, {
+            options: [
+                ['none', '不设置背景图'],
+                ['character', '当前角色卡作为背景图'],
+                ['custom', '上传自定义图片（图床链接）'],
+            ],
+            current: backgroundMode(),
+            host,
+            onPick: async (value) => {
+                if (value === 'custom') {
+                    const url = await askBackgroundImageUrl(extension_settings[extensionName]?.background_custom_url || '');
+                    if (url === null) return;   // 取消 → 保持原设置
+                    setBackgroundMode('custom', { customUrl: url });
+                    return;
+                }
+                setBackgroundMode(value);
+            },
+        });
+    });
+
+    // --- 上下文预算提醒 ---
+    $(document).on('change', '#hh-budget-toggle', async function() {
+        const on = $(this).is(':checked');
+        const s = extension_settings[extensionName];
+        if (!s) return;
+        // 提醒依赖聊天统计：勾选提醒时一并启用统计功能（标签页也会恢复显示）
+        if (on && !isFeatureEnabled('stats')) {
+            await setFeatureEnabled('stats', true);
+        }
+        s.budget_warning_enabled = on;
+        // 关闭提醒时直接隐藏并禁用预算输入框（提醒不会弹；统计页「总共」仍按已保存阈值标红）
+        $('#hh-budget-tokens').prop('disabled', !on).css('display', on ? '' : 'none');
+        saveSettingsDebounced();
+    });
+    $(document).on('change', '#hh-budget-tokens', function() {
+        const raw = Number($(this).val());
+        const v = Number.isFinite(raw) && raw > 0 ? Math.round(raw) : STATS_BUDGET_TOKENS_DEFAULT;
+        $(this).val(v);
+        extension_settings[extensionName].budget_tokens = v;
+        saveSettingsDebounced();
+        // 阈值同时控制统计页「总共」标红 → 统计页开着就重绘一次
+        if ($('.tab-panel[data-tab="token-stats-panel"]').hasClass('active')) updateTokenStatsUI();
     });
 
     // --- 功能启用/禁用开关（第三十六轮用户口径①）---
@@ -9027,50 +10603,30 @@ function setupEventListeners() {
         setFeatureEnabled(key, on);
     });
 
-    // --- 日志级别切换事件 ---
-    $(document).on('change', '#hide-helper-log-level-select', function() {
-        const newLevel = parseInt($(this).val());
-        extension_settings[extensionName].logLevel = newLevel;
-        applyLogLevel(newLevel);
-        saveSettingsDebounced();
-
-        const $downloadBtn = $('#hide-helper-download-log');
-        if (newLevel === 3) {
-            $downloadBtn.fadeIn(200);
-            logEnvironmentDetails(); // 切换到3时立马收集一次环境
-        } else {
-            $downloadBtn.fadeOut(200);
-            Logger.logHistory = []; // 非3级别，立刻清空内存垃圾
-        }
-
-        if (newLevel > 0) {
-            console.log(`%c[隐藏助手]`, 'font-weight: bold; color: #28a745;', `日志级别已更改为: ${['零日志', '核心日志', '运行日志', '完整日志'][newLevel]}`);
-        }
-    });
-
-    // --- 主题提示弹窗事件 ---
-
-    // 立即切换主题按钮
-    $(document).on('click', '#hide-helper-switch-theme-now', function() {
-        extension_settings[extensionName].theme_notification_viewed = true;
-        // 水波纹切换：以当前可见的提示弹窗左下角为圆心
-        applyThemeWithRipple('dark', {
-            afterFinish: () => {
-                closeThemeNotification();
-
-                // 实时重新渲染聊天统计
-                if ($('.tab-panel[data-tab="token-stats-panel"]').hasClass('active')) {
-                    updateTokenStatsUI();
-                }
-            },
+    // --- 日志级别切换事件（按钮 + 与背景图片选择同款浮层菜单）---
+    $(document).on('click', '#hide-helper-log-level-select', function() {
+        const trigger = this;
+        if (openTypeMenuTrigger === trigger) { closeTypeFilterMenu(); return; }
+        openTypeFilterMenu(trigger, {
+            options: [
+                ['0', '零日志（无输出）'],
+                ['1', '核心日志（错误+警告）'],
+                ['2', '运行日志（全部运行信息）'],
+                ['3', '完整日志（含调试）'],
+            ],
+            current: String(extension_settings[extensionName].logLevel ?? 0),
+            onPick: (value) => setLogLevel(parseInt(value, 10)),
         });
     });
 
-    // 我已知晓按钮
-    $(document).on('click', '#hide-helper-notification-close', function() {
-        extension_settings[extensionName].theme_notification_viewed = true;
+    // --- 新版主题/背景提示弹窗事件 ---
+
+    // 确认：关闭提示并提示后续入口（v2 已在展示时落盘，这里只负责收尾）
+    $(document).on('click', '#hide-helper-notification-confirm', function() {
+        extension_settings[extensionName].theme_notification_viewed_v2 = true;
         saveSettingsDebounced();
         closeThemeNotification();
+        notify('success', '后续可在【使用说明】页面随时切换UI主题和背景图片。');
     });
 
     // --- 日志UI显示开关事件 (带60分钟倒计时) ---
@@ -9429,6 +10985,16 @@ function setupEventListeners() {
         updateCurrentHideSettingsDisplay(); // 更新所有UI
         updateTokenStatsUI(); // 统计页若开着，立即切换为新聊天的锚定数据
 
+        // 角色卡背景跟随聊天切换：头像元素可能稍后才换图，立即 + 延迟各刷新一次
+        applyUserBackground();
+        watchAvatarForBackground();
+        updateBackgroundSelectLabel();
+        setTimeout(() => {
+            applyUserBackground();
+            watchAvatarForBackground();
+            updateBackgroundSelectLabel();
+        }, 350);
+
         if (extension_settings[extensionName]?.enabled) {
             Logger.debug('📢【事件】插件已启用，立即执行全量隐藏检查');
             runFullHideCheck(); // 立即执行，非防抖，确保数据最新
@@ -9553,6 +11119,20 @@ jQuery(async () => {
         // 应用保存的主题
         applyTheme(settings.theme || 'light');
 
+        // 背景图片（所有主题通用）
+        updateBackgroundSelectLabel();
+        applyUserBackground();
+        watchAvatarForBackground();
+
+        // 上下文预算提醒（提醒依赖聊天统计：统计关着时强制关闭提醒）
+        if (!isFeatureEnabled('stats') && settings.budget_warning_enabled) {
+            settings.budget_warning_enabled = false;
+        }
+        $('#hh-budget-toggle').prop('checked', !!settings.budget_warning_enabled);
+        $('#hh-budget-tokens').val(getBudgetTokens())
+            .prop('disabled', !settings.budget_warning_enabled)
+            .css('display', settings.budget_warning_enabled ? '' : 'none');
+
         // 应用保存的日志级别
         applyLogLevel(settings.logLevel || 0);
 
@@ -9597,6 +11177,15 @@ jQuery(async () => {
     if (typeof eventSource !== 'undefined' && typeof event_types !== 'undefined' && event_types.APP_READY) {
         Logger.info(`等待 '${event_types.APP_READY}' 事件进行初始化...`);
         eventSource.on(event_types.APP_READY, initializeExtension);
+        // 兜底：实测存在 APP_READY 已经发出、本插件监听注册晚了一步的情况（其它扩展同样中招），
+        // 此时事件永远不会再来 → 插件 UI 完全不出现。若 3 秒内仍没初始化，直接自己跑一次
+        // （initializeExtension 内部有 isInitialized 去重，正常情况下这个定时器是空操作）。
+        setTimeout(() => {
+            if (!isInitialized) {
+                Logger.warn('APP_READY 未在预期时间内触发，使用 3 秒兜底初始化');
+                initializeExtension();
+            }
+        }, 3000);
     } else {
         // 回退: 如果没有 app_ready 事件，或者 eventSource/event_types 加载失败
         Logger.error('严重错误: APP_READY 事件未找到或 eventSource/event_types 未定义。回退到 2 秒延迟');
